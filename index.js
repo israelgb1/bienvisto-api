@@ -129,6 +129,22 @@ async function handleApi(request, env, url) {
       return actualizarFolio(request, env, url, usuario);
     }
 
+    if (path === "/api/ventas" && method === "GET") {
+      return listarVentas(env);
+    }
+    if (path === "/api/ventas" && method === "POST") {
+      return crearVenta(request, env, usuario);
+    }
+    if (path.startsWith("/api/ventas/") && method === "PATCH") {
+      return actualizarVenta(request, env, url, usuario);
+    }
+    if (path === "/api/cortes" && method === "GET") {
+      return listarCortes(env);
+    }
+    if (path === "/api/cortes" && method === "POST") {
+      return crearCorte(request, env, usuario);
+    }
+
     return json({ error: "Endpoint no encontrado" }, 404);
   } catch (err) {
     console.error("api error", err);
@@ -417,6 +433,207 @@ async function borrarLote(env, url) {
   ]);
 
   return json({ success: true, id, folios_borrados: folios ? folios.n : 0 });
+}
+
+// ---------- Ventas y cortes (bloque 3a) ----------
+// Reglas del panel: display $350 con IVA, promoción de 3 por $900, comisión $150 por display.
+// La comisión no cambia con la promoción. Al vendedor se le entrega el total menos su comisión.
+const PRECIO_DISPLAY = 350;
+const PROMO_N = 3;
+const PROMO_PRECIO = 900;
+const COMISION_DISPLAY = 150;
+const MAX_VENTA = 50;
+const METODOS = ["efectivo", "transferencia"];
+const FACTURAS = ["no", "pide", "emitida"];
+
+function calcularVenta(n) {
+  const pares = Math.floor(n / PROMO_N);
+  const total = pares * PROMO_PRECIO + (n % PROMO_N) * PRECIO_DISPLAY;
+  const comision = n * COMISION_DISPLAY;
+  return { total, comision, aEntregar: total - comision, enPromo: pares * PROMO_N };
+}
+
+function limpiarTexto(valor, max) {
+  return typeof valor === "string" && valor.trim() ? valor.trim().slice(0, max) : null;
+}
+
+function limpiarFoliosVenta(lista) {
+  if (!Array.isArray(lista) || lista.length === 0 || lista.length > MAX_VENTA) return null;
+  const folios = lista.map((f) => String(f).toUpperCase());
+  if (folios.some((f) => !FOLIO_RE.test(f)) || new Set(folios).size !== folios.length) return null;
+  return folios;
+}
+
+async function listarVentas(env) {
+  const { results: ventas } = await env.DB.prepare("SELECT * FROM ventas ORDER BY created_at DESC").all();
+  const { results: vf } = await env.DB.prepare("SELECT folio, venta_id, precio, comision FROM venta_folios").all();
+  const porVenta = {};
+  for (const r of vf) {
+    (porVenta[r.venta_id] ||= []).push({ folio: r.folio, precio: r.precio, comision: r.comision });
+  }
+  return json(ventas.map((v) => ({ ...v, folios: porVenta[v.id] || [] })));
+}
+
+async function crearVenta(request, env, usuario) {
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  const vendedor = typeof body.vendedor_id === "string" ? body.vendedor_id : null;
+  if (!vendedor) return json({ error: "vendedor_id es obligatorio" }, 400);
+  const negocio = limpiarTexto(body.negocio, 200);
+  if (!negocio) return json({ error: "negocio es obligatorio" }, 400);
+  if (!METODOS.includes(body.metodo)) return json({ error: "metodo no válido" }, 400);
+  const folios = limpiarFoliosVenta(body.folios);
+  if (!folios) return json({ error: `folios debe tener entre 1 y ${MAX_VENTA} displays distintos` }, 400);
+
+  const v = await env.DB.prepare("SELECT id FROM vendedores WHERE id = ? AND estado = 'activo'").bind(vendedor).first();
+  if (!v) return json({ error: "Vendedor no válido o inactivo" }, 400);
+
+  const marcas = folios.map(() => "?").join(",");
+  const { results: fs } = await env.DB.prepare(`SELECT folio, estado, vendedor_id FROM folios WHERE folio IN (${marcas})`).bind(...folios).all();
+  if (fs.length !== folios.length) return json({ error: "Algún folio no existe" }, 404);
+  if (fs.some((f) => f.estado !== "libre" || f.vendedor_id !== vendedor)) {
+    return json({ error: "Solo se venden displays libres asignados a ese vendedor" }, 409);
+  }
+  const { results: ocupados } = await env.DB.prepare(`SELECT folio FROM venta_folios WHERE folio IN (${marcas})`).bind(...folios).all();
+  if (ocupados.length) return json({ error: "Algún display ya está en otra venta" }, 409);
+
+  const calc = calcularVenta(folios.length);
+  const id = "VN-" + crypto.randomUUID().slice(0, 8);
+  const stmts = [
+    env.DB.prepare(
+      "INSERT INTO ventas (id, vendedor_id, negocio, contacto, whatsapp, metodo, total, comision_total, a_entregar) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(id, vendedor, negocio, limpiarTexto(body.contacto, 120), limpiarWhatsapp(body.whatsapp), body.metodo, calc.total, calc.comision, calc.aEntregar),
+  ];
+  folios.forEach((folio, i) => {
+    const precio = i < calc.enPromo ? PROMO_PRECIO / PROMO_N : PRECIO_DISPLAY;
+    stmts.push(
+      env.DB.prepare("INSERT INTO venta_folios (folio, venta_id, precio, comision) VALUES (?, ?, ?, ?)").bind(folio, id, precio, COMISION_DISPLAY)
+    );
+  });
+  stmts.push(
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Creó venta ${id} (${negocio}, ${folios.length} displays)`)
+  );
+  await env.DB.batch(stmts);
+
+  return json({ success: true, id, total: calc.total, comision_total: calc.comision, a_entregar: calc.aEntregar }, 201);
+}
+
+async function actualizarVenta(request, env, url, usuario) {
+  const id = decodeURIComponent(url.pathname.slice("/api/ventas/".length));
+  if (!/^VN-[0-9a-f]{8}$/.test(id)) return json({ error: "Venta inválida" }, 400);
+
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  const venta = await env.DB.prepare("SELECT * FROM ventas WHERE id = ?").bind(id).first();
+  if (!venta) return json({ error: "Venta no encontrada" }, 404);
+
+  if (body.accion === "cobrar") return cobrarVenta(env, venta, body, usuario);
+  if (body.accion === "anular") return anularVenta(env, venta, usuario);
+  if (body.accion === "factura") {
+    if (!FACTURAS.includes(body.factura)) return json({ error: "factura no válida" }, 400);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE ventas SET factura = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(body.factura, id),
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Factura de venta ${id}: ${body.factura}`),
+    ]);
+    return json({ success: true, id, factura: body.factura });
+  }
+  return json({ error: "accion no válida" }, 400);
+}
+
+// Confirmar cobro: la venta pasa a cobrada, sus displays a activo con la URL de reseña.
+// Exige URL de Google válida. Si algún display ya no está libre, no se cobra nada.
+async function cobrarVenta(env, venta, body, usuario) {
+  if (venta.estado !== "pendiente") return json({ error: "Solo se cobra una venta pendiente" }, 409);
+  if (!esUrlResena(body.url_resena)) return json({ error: "url_resena debe ser una URL https de Google" }, 400);
+  const referencia = limpiarTexto(body.referencia, 100);
+  if (venta.metodo === "transferencia" && !referencia) {
+    return json({ error: "La transferencia requiere referencia" }, 400);
+  }
+
+  const { results: fs } = await env.DB.prepare(
+    "SELECT vf.folio, f.estado FROM venta_folios vf JOIN folios f ON f.folio = vf.folio WHERE vf.venta_id = ?"
+  ).bind(venta.id).all();
+  if (fs.some((f) => f.estado !== "libre")) return json({ error: "Algún display ya no está libre" }, 409);
+
+  const stmts = [
+    env.DB.prepare(
+      "UPDATE ventas SET estado = 'cobrada', referencia = ?, url_resena = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'"
+    ).bind(referencia, body.url_resena, venta.id),
+  ];
+  for (const f of fs) {
+    stmts.push(
+      env.DB.prepare(
+        "UPDATE folios SET estado = 'activo', url_destino = ?, negocio_asignado = ?, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'libre'"
+      ).bind(body.url_resena, venta.negocio, f.folio)
+    );
+    stmts.push(
+      env.DB.prepare("INSERT INTO auditoria_estados (folio, estado_anterior, estado_nuevo, cambiado_por) VALUES (?, 'libre', 'activo', ?)").bind(f.folio, usuario)
+    );
+  }
+  stmts.push(
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Cobró venta ${venta.id} (${venta.negocio})`)
+  );
+  await env.DB.batch(stmts);
+
+  return json({ success: true, id: venta.id, estado: "cobrada" });
+}
+
+// Anular solo antes de cobrar. Libera los displays para venderlos de nuevo.
+async function anularVenta(env, venta, usuario) {
+  if (venta.estado !== "pendiente") return json({ error: "Solo se anula una venta pendiente" }, 409);
+  await env.DB.batch([
+    env.DB.prepare("UPDATE ventas SET estado = 'anulada', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(venta.id),
+    env.DB.prepare("DELETE FROM venta_folios WHERE venta_id = ?").bind(venta.id),
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Anuló venta ${venta.id}`),
+  ]);
+  return json({ success: true, id: venta.id, estado: "anulada" });
+}
+
+// Saldo del vendedor = lo que debe entregar de ventas cobradas, menos lo ya entregado (monto + ajuste).
+const SQL_SALDOS = `SELECT v.id AS vendedor_id,
+  COALESCE((SELECT SUM(a_entregar) FROM ventas WHERE vendedor_id = v.id AND estado = 'cobrada'), 0)
+  - COALESCE((SELECT SUM(monto + ajuste) FROM cortes WHERE vendedor_id = v.id), 0) AS saldo
+  FROM vendedores v`;
+
+async function listarCortes(env) {
+  const { results: cortes } = await env.DB.prepare("SELECT * FROM cortes ORDER BY created_at DESC").all();
+  const { results: saldos } = await env.DB.prepare(SQL_SALDOS).all();
+  return json({ cortes, saldos });
+}
+
+// Corte = entrega del vendedor a Bien Visto. El ajuste descuenta del saldo sin dinero
+// (por ejemplo, una anulación ya cobrada). No puede pasar del saldo.
+async function crearCorte(request, env, usuario) {
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  const vendedor = typeof body.vendedor_id === "string" ? body.vendedor_id : null;
+  const v = vendedor ? await env.DB.prepare("SELECT id FROM vendedores WHERE id = ?").bind(vendedor).first() : null;
+  if (!v) return json({ error: "Vendedor no válido" }, 400);
+
+  const monto = Number(body.monto);
+  if (!Number.isFinite(monto) || monto <= 0) return json({ error: "monto debe ser mayor que cero" }, 400);
+  const ajuste = body.ajuste === undefined ? 0 : Number(body.ajuste);
+  if (!Number.isFinite(ajuste) || ajuste < 0) return json({ error: "ajuste no válido" }, 400);
+  if (!METODOS.includes(body.metodo)) return json({ error: "metodo no válido" }, 400);
+  const referencia = limpiarTexto(body.referencia, 100);
+  if (body.metodo === "transferencia" && !referencia) return json({ error: "La transferencia requiere referencia" }, 400);
+
+  const fila = await env.DB.prepare(`${SQL_SALDOS} WHERE v.id = ?`).bind(vendedor).first();
+  const saldo = fila ? Math.round(fila.saldo * 100) / 100 : 0;
+  const pedido = Math.round((monto + ajuste) * 100) / 100;
+  if (pedido > saldo + 0.001) return json({ error: `El corte supera el saldo pendiente (${saldo})` }, 409);
+
+  const id = "CO-" + crypto.randomUUID().slice(0, 8);
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO cortes (id, vendedor_id, monto, metodo, referencia, ajuste, usuario) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(id, vendedor, monto, body.metodo, referencia, ajuste, usuario),
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Corte ${id} de ${vendedor}: ${monto} (ajuste ${ajuste})`),
+  ]);
+  return json({ success: true, id, saldo_restante: Math.round((saldo - pedido) * 100) / 100 }, 201);
 }
 
 async function actualizarFolio(request, env, url, usuario) {
