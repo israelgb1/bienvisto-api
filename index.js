@@ -28,6 +28,33 @@ const DIGITOS = "23456789";
 const FOLIO_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ][2-9][ABCDEFGHJKLMNPQRSTUVWXYZ][2-9]$/;
 
 const MAX_LOTE = 100;
+// Duración de una prueba, en minutos. Al vencer, el display pasa a libre.
+const PRUEBA_MINUTOS = 30;
+
+// Pasa a libre los displays en prueba vencidos. Se llama antes de leer,
+// así el estado siempre sale correcto sin tarea programada.
+async function aplicarVencimientos(env, usuario, folio) {
+  const filtro = folio
+    ? "estado = 'prueba' AND prueba_inicio IS NOT NULL AND folio = ? AND prueba_inicio <= datetime('now', ?)"
+    : "estado = 'prueba' AND prueba_inicio IS NOT NULL AND prueba_inicio <= datetime('now', ?)";
+  const corte = `-${PRUEBA_MINUTOS} minutes`;
+  const q = folio
+    ? env.DB.prepare(`SELECT folio, estado FROM folios WHERE ${filtro}`).bind(folio, corte)
+    : env.DB.prepare(`SELECT folio, estado FROM folios WHERE ${filtro}`).bind(corte);
+  const { results } = await q.all();
+  if (!results.length) return;
+
+  const stmts = [];
+  for (const r of results) {
+    stmts.push(
+      env.DB.prepare("UPDATE folios SET estado = 'libre', prueba_inicio = NULL, negocio_asignado = NULL, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'prueba'").bind(r.folio)
+    );
+    stmts.push(
+      env.DB.prepare("INSERT INTO auditoria_estados (folio, estado_anterior, estado_nuevo, cambiado_por) VALUES (?, 'prueba', 'libre', ?)").bind(r.folio, usuario || "sistema")
+    );
+  }
+  await env.DB.batch(stmts);
+}
 
 export default {
   async fetch(request, env) {
@@ -110,8 +137,9 @@ async function handleApi(request, env, url) {
 }
 
 async function listarFolios(env) {
+  await aplicarVencimientos(env, "sistema", null);
   const { results } = await env.DB.prepare(
-    "SELECT folio, estado, negocio_asignado, url_destino, lote_id, vendedor_id, created_at, updated_at FROM folios ORDER BY created_at DESC"
+    "SELECT folio, estado, negocio_asignado, url_destino, lote_id, vendedor_id, prueba_inicio, created_at, updated_at FROM folios ORDER BY created_at DESC"
   ).all();
   return json(results);
 }
@@ -412,6 +440,7 @@ async function actualizarFolio(request, env, url, usuario) {
     }
   }
 
+  await aplicarVencimientos(env, usuario, folio);
   const actual = await env.DB.prepare("SELECT estado FROM folios WHERE folio = ?").bind(folio).first();
   if (!actual) {
     return json({ error: "Folio no encontrado" }, 404);
@@ -421,6 +450,11 @@ async function actualizarFolio(request, env, url, usuario) {
 
   const sets = ["estado = ?", "updated_at = CURRENT_TIMESTAMP"];
   const params = [nuevoEstado];
+  if (nuevoEstado === "prueba" && actual.estado !== "prueba") {
+    sets.push("prueba_inicio = CURRENT_TIMESTAMP");
+  } else if (nuevoEstado !== "prueba" && actual.estado === "prueba") {
+    sets.push("prueba_inicio = NULL");
+  }
   if ("negocio_asignado" in body) {
     sets.push("negocio_asignado = ?");
     params.push(body.negocio_asignado);
@@ -462,6 +496,7 @@ async function handleRedirect(request, env, url) {
     return new Response("Error: El folio no existe.", { status: 404 });
   }
 
+  await aplicarVencimientos(env, "sistema", folio);
   const display = await env.DB.prepare("SELECT estado, url_destino FROM folios WHERE folio = ?")
     .bind(folio)
     .first();
