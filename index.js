@@ -130,6 +130,12 @@ async function handleApi(request, env, url) {
     if (path === "/api/auditoria" && method === "GET") {
       return listarAuditoria(env);
     }
+    if (path === "/api/precios" && method === "GET") {
+      const { results } = await env.DB.prepare(
+        "SELECT fecha, precio, comision, promo_n, promo_precio, usuario, nota FROM precios_historial ORDER BY id DESC LIMIT 200"
+      ).all();
+      return json(results);
+    }
     if (path === "/api/config" && method === "GET") {
       return json(await leerConfig(env));
     }
@@ -473,10 +479,14 @@ async function leerConfig(env) {
   return cfg;
 }
 
+const CLAVES_PRECIO = ["precio_display", "comision_display", "promo_n", "promo_precio"];
+
 async function actualizarConfig(request, env, usuario) {
   const body = await leerJson(request);
   if (body === null) return json({ error: "JSON inválido" }, 400);
 
+  const nota = typeof body.nota === "string" && body.nota.trim() ? body.nota.trim().slice(0, 100) : null;
+  delete body.nota;
   const claves = Object.keys(body);
   if (claves.length === 0) return json({ error: "Nada que actualizar" }, 400);
   for (const k of claves) {
@@ -509,8 +519,18 @@ async function actualizarConfig(request, env, usuario) {
       env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Config ${k} = ${body[k]}`)
     );
   }
+  const antes = await leerConfig(env);
   await env.DB.batch(stmts);
-  return json(await leerConfig(env));
+  const despues = await leerConfig(env);
+
+  // Historial de precios: solo si cambia precio, comisión o promoción.
+  const cambioPrecio = CLAVES_PRECIO.some((k) => antes[k] !== despues[k]);
+  if (cambioPrecio) {
+    await env.DB.prepare(
+      "INSERT INTO precios_historial (precio, comision, promo_n, promo_precio, usuario, nota) VALUES (?, ?, ?, ?, ?, ?)"
+    ).bind(despues.precio_display, despues.comision_display, despues.promo_n, despues.promo_precio, usuario, nota || "Cambio desde Ajustes").run();
+  }
+  return json(despues);
 }
 
 // ---------- Ventas y cortes (bloque 3a) ----------
