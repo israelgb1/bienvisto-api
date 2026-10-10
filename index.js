@@ -966,8 +966,10 @@ async function actualizarSolicitud(request, env, url, usuario) {
   if (s.estado !== "pendiente") return json({ error: "La solicitud ya fue resuelta" }, 409);
 
   if (body.accion === "rechazar") {
+    const motivo = limpiarTexto(body.motivo, 200);
+    if (!motivo || motivo.length < 5) return json({ error: "Escribe el motivo del rechazo (mínimo 5 caracteres)" }, 400);
     await env.DB.batch([
-      env.DB.prepare("UPDATE solicitudes SET estado = 'rechazada', resuelto_por = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(usuario, id),
+      env.DB.prepare("UPDATE solicitudes SET estado = 'rechazada', motivo_rechazo = ?, resuelto_por = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(motivo, usuario, id),
       env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, ?)").bind(usuario, `Solicitud ${id} rechazada`, s.folio),
     ]);
     return json({ success: true, id, estado: "rechazada" });
