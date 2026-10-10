@@ -178,10 +178,11 @@ async function generarLote(request, env, usuario) {
 
 // ---------- Vendedores ----------
 const MAX_ASIGNAR = 50;
+const NIVELES = ["nuevo", "confianza"];
 
 async function listarVendedores(env) {
   const { results } = await env.DB.prepare(
-    "SELECT id, nombre, whatsapp, correo, estado, fecha_registro FROM vendedores ORDER BY fecha_registro DESC"
+    "SELECT id, nombre, whatsapp, correo, nivel, estado, fecha_registro FROM vendedores ORDER BY fecha_registro DESC"
   ).all();
   return json(results);
 }
@@ -207,10 +208,12 @@ async function crearVendedor(request, env, usuario) {
   const whatsapp = limpiarWhatsapp(body.whatsapp);
   const correo = limpiarCorreo(body.correo);
   if (correo === undefined) return json({ error: "correo no válido" }, 400);
+  const nivel = body.nivel === undefined ? "nuevo" : body.nivel;
+  if (!NIVELES.includes(nivel)) return json({ error: "nivel no válido" }, 400);
 
   const id = "V-" + crypto.randomUUID().slice(0, 8);
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO vendedores (id, nombre, whatsapp, correo, estado) VALUES (?, ?, ?, ?, 'activo')").bind(id, nombre, whatsapp, correo),
+    env.DB.prepare("INSERT INTO vendedores (id, nombre, whatsapp, correo, nivel, estado) VALUES (?, ?, ?, ?, ?, 'activo')").bind(id, nombre, whatsapp, correo, nivel),
     env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Alta de vendedor ${id} (${nombre})`),
   ]);
   return json({ success: true, id }, 201);
@@ -221,7 +224,7 @@ async function actualizarVendedor(request, env, url, usuario) {
   const body = await leerJson(request);
   if (body === null) return json({ error: "JSON inválido" }, 400);
 
-  const actual = await env.DB.prepare("SELECT id, nombre, whatsapp, correo, estado FROM vendedores WHERE id = ?").bind(id).first();
+  const actual = await env.DB.prepare("SELECT id, nombre, whatsapp, correo, nivel, estado FROM vendedores WHERE id = ?").bind(id).first();
   if (!actual) return json({ error: "Vendedor no encontrado" }, 404);
 
   const nombre = body.nombre !== undefined ? (typeof body.nombre === "string" ? body.nombre.trim().slice(0, 120) : "") : actual.nombre;
@@ -229,6 +232,8 @@ async function actualizarVendedor(request, env, url, usuario) {
   const whatsapp = body.whatsapp !== undefined ? limpiarWhatsapp(body.whatsapp) : actual.whatsapp;
   const correo = body.correo !== undefined ? limpiarCorreo(body.correo) : actual.correo;
   if (correo === undefined) return json({ error: "correo no válido" }, 400);
+  const nivel = body.nivel !== undefined ? body.nivel : actual.nivel;
+  if (!NIVELES.includes(nivel)) return json({ error: "nivel no válido" }, 400);
   const estado = body.estado !== undefined ? body.estado : actual.estado;
   if (estado !== "activo" && estado !== "inactivo") {
     return json({ error: "estado no válido" }, 400);
@@ -270,7 +275,7 @@ async function actualizarVendedor(request, env, url, usuario) {
   }
 
   stmts.push(
-    env.DB.prepare("UPDATE vendedores SET nombre = ?, whatsapp = ?, correo = ?, estado = ? WHERE id = ?").bind(nombre, whatsapp, correo, estado, id)
+    env.DB.prepare("UPDATE vendedores SET nombre = ?, whatsapp = ?, correo = ?, nivel = ?, estado = ? WHERE id = ?").bind(nombre, whatsapp, correo, nivel, estado, id)
   );
   await env.DB.batch(stmts);
 
