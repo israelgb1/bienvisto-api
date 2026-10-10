@@ -70,6 +70,10 @@ async function handleApi(request, env, url) {
       return json(results);
     }
 
+    if (path.startsWith("/api/lotes/") && method === "PATCH") {
+      return actualizarLote(request, env, url);
+    }
+
     if (path === "/api/displays/batch" && method === "POST") {
       return generarLote(request, env, usuario);
     }
@@ -150,6 +154,33 @@ async function generarLote(request, env, usuario) {
   await env.DB.batch(stmts);
 
   return json({ success: true, lote_id: loteId, total: generados.length, folios: generados }, 201);
+}
+
+async function actualizarLote(request, env, url) {
+  const id = decodeURIComponent(url.pathname.slice("/api/lotes/".length));
+  if (!/^LOTE-\d+$/.test(id)) {
+    return json({ error: "Lote inválido" }, 400);
+  }
+
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  const existe = await env.DB.prepare("SELECT id FROM lotes WHERE id = ?").bind(id).first();
+  if (!existe) return json({ error: "Lote no encontrado" }, 404);
+
+  const tipo = typeof body.tipo === "string" && body.tipo.trim() ? body.tipo.trim().slice(0, 100) : "Reseñas de Google";
+  const costo = body.costo === undefined ? 0 : Number(body.costo);
+  if (!Number.isFinite(costo) || costo < 0 || costo > 100000) {
+    return json({ error: "costo no válido" }, 400);
+  }
+  const destino = typeof body.destino === "string" && body.destino.trim() ? body.destino.trim().slice(0, 200) : null;
+  const nota = typeof body.nota === "string" && body.nota.trim() ? body.nota.trim().slice(0, 300) : null;
+
+  await env.DB.prepare("UPDATE lotes SET tipo = ?, costo = ?, destino = ?, nota = ? WHERE id = ?")
+    .bind(tipo, costo, destino, nota, id)
+    .run();
+
+  return json({ success: true, id });
 }
 
 async function actualizarFolio(request, env, url, usuario) {
