@@ -709,7 +709,7 @@ async function cobrarVenta(env, venta, body, usuario) {
 
   const stmts = [
     env.DB.prepare(
-      "UPDATE ventas SET estado = 'cobrada', referencia = ?, url_resena = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado IN ('pendiente','rev')"
+      "UPDATE ventas SET estado = 'cobrada', referencia = ?, url_resena = ?, impago = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado IN ('pendiente','rev')"
     ).bind(referencia, body.url_resena, venta.id),
   ];
   for (const f of fs) {
