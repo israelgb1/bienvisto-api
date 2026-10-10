@@ -158,6 +158,21 @@ async function handleApi(request, env, url) {
     if (path === "/api/cortes" && method === "POST") {
       return crearCorte(request, env, usuario);
     }
+    if (/^\/api\/ventas\/[^/]+\/comprobante$/.test(path) && method === "POST") {
+      return guardarComprobante(request, env, url, usuario);
+    }
+    if (/^\/api\/ventas\/[^/]+\/comprobante$/.test(path) && method === "GET") {
+      return leerComprobante(env, url);
+    }
+    if (path === "/api/solicitudes" && method === "GET") {
+      return listarSolicitudes(env);
+    }
+    if (path === "/api/solicitudes" && method === "POST") {
+      return crearSolicitud(request, env, usuario);
+    }
+    if (path.startsWith("/api/solicitudes/") && method === "PATCH") {
+      return actualizarSolicitud(request, env, url, usuario);
+    }
 
     return json({ error: "Endpoint no encontrado" }, 404);
   } catch (err) {
@@ -624,6 +639,7 @@ async function actualizarVenta(request, env, url, usuario) {
   const venta = await env.DB.prepare("SELECT * FROM ventas WHERE id = ?").bind(id).first();
   if (!venta) return json({ error: "Venta no encontrada" }, 404);
 
+  if (body.accion === "enviar_revision") return enviarRevision(env, venta, body);
   if (body.accion === "cobrar") return cobrarVenta(env, venta, body, usuario);
   if (body.accion === "anular") return anularVenta(env, venta, usuario);
   if (body.accion === "factura") {
@@ -639,10 +655,32 @@ async function actualizarVenta(request, env, url, usuario) {
 
 // Confirmar cobro: la venta pasa a cobrada, sus displays a activo con la URL de reseña.
 // Exige URL de Google válida. Si algún display ya no está libre, no se cobra nada.
+// Pendiente -> rev: el vendedor avisa que ya se pagó y se revisa el pago. Transferencia exige referencia.
+async function enviarRevision(env, venta, body) {
+  if (venta.estado !== "pendiente") return json({ error: "Solo una venta pendiente pasa a revisión" }, 409);
+  const referencia = limpiarTexto(body.referencia, 100) || venta.referencia;
+  if (venta.metodo === "transferencia" && !referencia) {
+    return json({ error: "La transferencia requiere referencia" }, 400);
+  }
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE ventas SET estado = 'rev', referencia = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'"
+    ).bind(referencia, venta.id),
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(
+      "sistema",
+      `Venta ${venta.id} enviada a revisión`
+    ),
+  ]);
+  return json({ success: true, id: venta.id, estado: "rev" });
+}
+
+// Cobro desde pendiente o rev. Exige URL de Google válida.
 async function cobrarVenta(env, venta, body, usuario) {
-  if (venta.estado !== "pendiente") return json({ error: "Solo se cobra una venta pendiente" }, 409);
+  if (venta.estado !== "pendiente" && venta.estado !== "rev") {
+    return json({ error: "Solo se cobra una venta pendiente o en revisión" }, 409);
+  }
   if (!esUrlResena(body.url_resena)) return json({ error: "url_resena debe ser una URL https de Google" }, 400);
-  const referencia = limpiarTexto(body.referencia, 100);
+  const referencia = limpiarTexto(body.referencia, 100) || venta.referencia;
   if (venta.metodo === "transferencia" && !referencia) {
     return json({ error: "La transferencia requiere referencia" }, 400);
   }
@@ -654,7 +692,7 @@ async function cobrarVenta(env, venta, body, usuario) {
 
   const stmts = [
     env.DB.prepare(
-      "UPDATE ventas SET estado = 'cobrada', referencia = ?, url_resena = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'"
+      "UPDATE ventas SET estado = 'cobrada', referencia = ?, url_resena = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado IN ('pendiente','rev')"
     ).bind(referencia, body.url_resena, venta.id),
   ];
   for (const f of fs) {
@@ -675,20 +713,41 @@ async function cobrarVenta(env, venta, body, usuario) {
   return json({ success: true, id: venta.id, estado: "cobrada" });
 }
 
-// Anular solo antes de cobrar. Libera los displays para venderlos de nuevo.
+// Anular: permitido en pendiente, rev o cobrada, siempre que no haya entregas (entregado = 0).
+// Si la venta ya estaba cobrada, sus displays activos vuelven a libre y se registran en auditoría de estados.
 async function anularVenta(env, venta, usuario) {
-  if (venta.estado !== "pendiente") return json({ error: "Solo se anula una venta pendiente" }, 409);
-  await env.DB.batch([
-    env.DB.prepare("UPDATE ventas SET estado = 'anulada', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(venta.id),
-    env.DB.prepare("DELETE FROM venta_folios WHERE venta_id = ?").bind(venta.id),
-    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Anuló venta ${venta.id}`),
-  ]);
+  if (!["pendiente", "rev", "cobrada"].includes(venta.estado)) {
+    return json({ error: "Esta venta no se puede anular" }, 409);
+  }
+  if (Number(venta.entregado) > 0) return json({ error: "La venta ya tiene entregas; no se puede anular" }, 409);
+
+  const stmts = [
+    env.DB.prepare("UPDATE ventas SET estado = 'anulada', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = ?").bind(venta.id, venta.estado),
+  ];
+  if (venta.estado === "cobrada") {
+    const { results: activos } = await env.DB.prepare(
+      "SELECT vf.folio FROM venta_folios vf JOIN folios f ON f.folio = vf.folio WHERE vf.venta_id = ? AND f.estado = 'activo'"
+    ).bind(venta.id).all();
+    for (const f of activos) {
+      stmts.push(
+        env.DB.prepare(
+          "UPDATE folios SET estado = 'libre', negocio_asignado = NULL, url_destino = NULL, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'activo'"
+        ).bind(f.folio)
+      );
+      stmts.push(
+        env.DB.prepare("INSERT INTO auditoria_estados (folio, estado_anterior, estado_nuevo, cambiado_por) VALUES (?, 'activo', 'libre', ?)").bind(f.folio, usuario)
+      );
+    }
+  }
+  stmts.push(env.DB.prepare("DELETE FROM venta_folios WHERE venta_id = ?").bind(venta.id));
+  stmts.push(env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Anuló venta ${venta.id} (estado previo: ${venta.estado})`));
+  await env.DB.batch(stmts);
   return json({ success: true, id: venta.id, estado: "anulada" });
 }
 
-// Saldo del vendedor = lo que debe entregar de ventas cobradas, menos lo ya entregado (monto + ajuste).
+// Saldo del vendedor = lo que debe entregar de ventas cobradas o entregadas, menos lo ya entregado (monto + ajuste de cortes).
 const SQL_SALDOS = `SELECT v.id AS vendedor_id,
-  COALESCE((SELECT SUM(a_entregar) FROM ventas WHERE vendedor_id = v.id AND estado = 'cobrada'), 0)
+  COALESCE((SELECT SUM(a_entregar) FROM ventas WHERE vendedor_id = v.id AND estado IN ('cobrada','entregada')), 0)
   - COALESCE((SELECT SUM(monto + ajuste) FROM cortes WHERE vendedor_id = v.id), 0) AS saldo
   FROM vendedores v`;
 
@@ -721,14 +780,199 @@ async function crearCorte(request, env, usuario) {
   const pedido = Math.round((monto + ajuste) * 100) / 100;
   if (pedido > saldo + 0.001) return json({ error: `El corte supera el saldo pendiente (${saldo})` }, 409);
 
+  // Asignación FIFO: el corte se aplica a las ventas más antiguas con saldo pendiente.
+  // Una venta queda 'entregada' cuando su a_entregar está cubierto por completo.
+  const { results: abiertas } = await env.DB.prepare(
+    "SELECT id, a_entregar, entregado FROM ventas WHERE vendedor_id = ? AND estado IN ('cobrada','entregada') AND a_entregar - entregado > 0.001 ORDER BY created_at ASC, id ASC"
+  ).bind(vendedor).all();
+
   const id = "CO-" + crypto.randomUUID().slice(0, 8);
-  await env.DB.batch([
+  const stmts = [
     env.DB.prepare(
       "INSERT INTO cortes (id, vendedor_id, monto, metodo, referencia, ajuste, usuario) VALUES (?, ?, ?, ?, ?, ?, ?)"
     ).bind(id, vendedor, monto, body.metodo, referencia, ajuste, usuario),
-    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Corte ${id} de ${vendedor}: ${monto} (ajuste ${ajuste})`),
-  ]);
+  ];
+  let resto = pedido;
+  for (const v of abiertas) {
+    if (resto <= 0.001) break;
+    const pendiente = Math.round((v.a_entregar - v.entregado) * 100) / 100;
+    const toma = Math.min(resto, pendiente);
+    const nuevoEntregado = Math.round((v.entregado + toma) * 100) / 100;
+    const nuevoEstado = nuevoEntregado >= v.a_entregar - 0.001 ? "entregada" : "cobrada";
+    stmts.push(
+      env.DB.prepare("UPDATE ventas SET entregado = ?, estado = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(nuevoEntregado, nuevoEstado, v.id)
+    );
+    resto = Math.round((resto - toma) * 100) / 100;
+  }
+  if (resto > 0.001) return json({ error: "No hay ventas suficientes para aplicar el corte" }, 409);
+
+  stmts.push(
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Corte ${id} de ${vendedor}: ${monto} (ajuste ${ajuste})`)
+  );
+  await env.DB.batch(stmts);
   return json({ success: true, id, saldo_restante: Math.round((saldo - pedido) * 100) / 100 }, 201);
+}
+
+// ---------- Comprobantes (R2) ----------
+// Binding requerido: COMPROBANTES -> bucket bienvisto-comprobantes.
+const COMPROBANTE_TIPOS = ["image/jpeg", "image/png", "image/webp", "application/pdf"];
+const COMPROBANTE_MAX = 5 * 1024 * 1024;
+
+function idVentaDesde(url) {
+  const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+  return /^VN-[0-9a-f]{8}$/.test(id) ? id : null;
+}
+
+async function guardarComprobante(request, env, url, usuario) {
+  const id = idVentaDesde(url);
+  if (!id) return json({ error: "Venta inválida" }, 400);
+  if (!env.COMPROBANTES) return json({ error: "Almacenamiento de comprobantes no configurado" }, 503);
+
+  const venta = await env.DB.prepare("SELECT id, estado, comprobante_key FROM ventas WHERE id = ?").bind(id).first();
+  if (!venta) return json({ error: "Venta no encontrada" }, 404);
+  if (venta.estado === "anulada") return json({ error: "La venta está anulada" }, 409);
+
+  const tipo = (request.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (!COMPROBANTE_TIPOS.includes(tipo)) return json({ error: "Tipo de archivo no permitido (jpg, png, webp o pdf)" }, 415);
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength === 0) return json({ error: "Archivo vacío" }, 400);
+  if (bytes.byteLength > COMPROBANTE_MAX) return json({ error: "El archivo supera 5 MB" }, 413);
+
+  const key = `comprobantes/${id}/${crypto.randomUUID()}`;
+  await env.COMPROBANTES.put(key, bytes, { httpMetadata: { contentType: tipo } });
+  await env.DB.batch([
+    env.DB.prepare("UPDATE ventas SET comprobante_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(key, id),
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Comprobante cargado en venta ${id}`),
+  ]);
+  if (venta.comprobante_key) {
+    try {
+      await env.COMPROBANTES.delete(venta.comprobante_key);
+    } catch (err) {
+      console.error("no se pudo borrar comprobante anterior", err);
+    }
+  }
+  return json({ success: true, id, comprobante_key: key }, 201);
+}
+
+async function leerComprobante(env, url) {
+  const id = idVentaDesde(url);
+  if (!id) return json({ error: "Venta inválida" }, 400);
+  if (!env.COMPROBANTES) return json({ error: "Almacenamiento de comprobantes no configurado" }, 503);
+
+  const venta = await env.DB.prepare("SELECT comprobante_key FROM ventas WHERE id = ?").bind(id).first();
+  if (!venta) return json({ error: "Venta no encontrada" }, 404);
+  if (!venta.comprobante_key) return json({ error: "La venta no tiene comprobante" }, 404);
+
+  const obj = await env.COMPROBANTES.get(venta.comprobante_key);
+  if (!obj) return json({ error: "Comprobante no encontrado" }, 404);
+  return new Response(obj.body, {
+    headers: {
+      "content-type": obj.httpMetadata?.contentType || "application/octet-stream",
+      "cache-control": "private, no-store",
+    },
+  });
+}
+
+// ---------- Solicitudes de reposición y cambio de negocio ----------
+// reponer: el display activo se retira y su lugar lo toma un display libre del mismo vendedor (con la misma URL y negocio).
+// cambiar: el display sigue activo, con un negocio nuevo y su URL de reseña.
+const TIPOS_SOLICITUD = ["reponer", "cambiar"];
+
+async function listarSolicitudes(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM solicitudes ORDER BY created_at DESC").all();
+  return json(results);
+}
+
+async function crearSolicitud(request, env, usuario) {
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  if (!TIPOS_SOLICITUD.includes(body.tipo)) return json({ error: "tipo no válido" }, 400);
+  const folio = typeof body.folio === "string" ? body.folio.toUpperCase() : "";
+  if (!FOLIO_RE.test(folio)) return json({ error: "Folio inválido" }, 400);
+  const vendedor = typeof body.vendedor_id === "string" ? body.vendedor_id : null;
+  if (!vendedor) return json({ error: "vendedor_id es obligatorio" }, 400);
+  const nuevoNegocio = limpiarTexto(body.nuevo_negocio, 200);
+  if (body.tipo === "cambiar" && !nuevoNegocio) return json({ error: "nuevo_negocio es obligatorio para cambiar" }, 400);
+
+  const d = await env.DB.prepare("SELECT estado, vendedor_id FROM folios WHERE folio = ?").bind(folio).first();
+  if (!d) return json({ error: "Folio no encontrado" }, 404);
+  if (d.vendedor_id !== vendedor) return json({ error: "El display no pertenece a ese vendedor" }, 409);
+  if (d.estado !== "activo") return json({ error: "Solo se reponen o cambian displays activos" }, 409);
+  const pendiente = await env.DB.prepare("SELECT id FROM solicitudes WHERE folio = ? AND estado = 'pendiente'").bind(folio).first();
+  if (pendiente) return json({ error: "Ya hay una solicitud pendiente para ese display" }, 409);
+
+  const id = "SO-" + crypto.randomUUID().slice(0, 8);
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO solicitudes (id, tipo, folio, vendedor_id, motivo, nota, nuevo_negocio, foto_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(id, body.tipo, folio, vendedor, limpiarTexto(body.motivo, 200), limpiarTexto(body.nota, 500), nuevoNegocio, limpiarTexto(body.foto_key, 300)),
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, ?)").bind(usuario, `Solicitud ${id} (${body.tipo})`, folio),
+  ]);
+  return json({ success: true, id }, 201);
+}
+
+async function actualizarSolicitud(request, env, url, usuario) {
+  const id = decodeURIComponent(url.pathname.slice("/api/solicitudes/".length));
+  if (!/^SO-[0-9a-f]{8}$/.test(id)) return json({ error: "Solicitud inválida" }, 400);
+
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  const s = await env.DB.prepare("SELECT * FROM solicitudes WHERE id = ?").bind(id).first();
+  if (!s) return json({ error: "Solicitud no encontrada" }, 404);
+  if (s.estado !== "pendiente") return json({ error: "La solicitud ya fue resuelta" }, 409);
+
+  if (body.accion === "rechazar") {
+    await env.DB.batch([
+      env.DB.prepare("UPDATE solicitudes SET estado = 'rechazada', resuelto_por = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(usuario, id),
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, ?)").bind(usuario, `Solicitud ${id} rechazada`, s.folio),
+    ]);
+    return json({ success: true, id, estado: "rechazada" });
+  }
+  if (body.accion !== "aprobar") return json({ error: "accion no válida" }, 400);
+
+  const viejo = await env.DB.prepare("SELECT folio, estado, vendedor_id, url_destino, negocio_asignado FROM folios WHERE folio = ?").bind(s.folio).first();
+  if (!viejo || viejo.estado !== "activo") return json({ error: "El display ya no está activo" }, 409);
+
+  if (s.tipo === "reponer") {
+    const nuevo = typeof body.folio_nuevo === "string" ? body.folio_nuevo.toUpperCase() : "";
+    if (!FOLIO_RE.test(nuevo) || nuevo === s.folio) return json({ error: "folio_nuevo no válido" }, 400);
+    if (!viejo.url_destino) return json({ error: "El display a reponer no tiene URL de reseña" }, 409);
+
+    const f = await env.DB.prepare("SELECT estado, vendedor_id FROM folios WHERE folio = ?").bind(nuevo).first();
+    if (!f) return json({ error: "folio_nuevo no existe" }, 404);
+    if (f.estado !== "libre" || f.vendedor_id !== s.vendedor_id) {
+      return json({ error: "El display nuevo debe estar libre y asignado al mismo vendedor" }, 409);
+    }
+    const enVenta = await env.DB.prepare("SELECT venta_id FROM venta_folios WHERE folio = ?").bind(nuevo).first();
+    if (enVenta) return json({ error: "El display nuevo ya está en una venta" }, 409);
+
+    await env.DB.batch([
+      env.DB.prepare("UPDATE folios SET estado = 'retirado', updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'activo'").bind(s.folio),
+      env.DB.prepare("INSERT INTO auditoria_estados (folio, estado_anterior, estado_nuevo, cambiado_por) VALUES (?, 'activo', 'retirado', ?)").bind(s.folio, usuario),
+      env.DB.prepare(
+        "UPDATE folios SET estado = 'activo', url_destino = ?, negocio_asignado = ?, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'libre'"
+      ).bind(viejo.url_destino, viejo.negocio_asignado, nuevo),
+      env.DB.prepare("INSERT INTO auditoria_estados (folio, estado_anterior, estado_nuevo, cambiado_por) VALUES (?, 'libre', 'activo', ?)").bind(nuevo, usuario),
+      env.DB.prepare("UPDATE venta_folios SET folio = ? WHERE folio = ?").bind(nuevo, s.folio),
+      env.DB.prepare("UPDATE solicitudes SET estado = 'aprobada', resuelto_por = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(usuario, id),
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, ?)").bind(usuario, `Reposición ${s.folio} → ${nuevo} (solicitud ${id})`, nuevo),
+    ]);
+    return json({ success: true, id, estado: "aprobada", folio_nuevo: nuevo });
+  }
+
+  // cambiar
+  const url_resena = body.url_resena;
+  if (!esUrlResena(url_resena)) return json({ error: "url_resena debe ser una URL https de Google" }, 400);
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE folios SET url_destino = ?, negocio_asignado = ?, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'activo'"
+    ).bind(url_resena, s.nuevo_negocio, s.folio),
+    env.DB.prepare("UPDATE solicitudes SET estado = 'aprobada', resuelto_por = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(usuario, id),
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, ?)").bind(usuario, `Cambio de negocio ${s.folio} → ${s.nuevo_negocio} (solicitud ${id})`, s.folio),
+  ]);
+  return json({ success: true, id, estado: "aprobada" });
 }
 
 async function actualizarFolio(request, env, url, usuario) {
