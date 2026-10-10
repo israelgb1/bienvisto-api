@@ -127,6 +127,9 @@ async function handleApi(request, env, url) {
       return actualizarFolio(request, env, url, usuario);
     }
 
+    if (path === "/api/auditoria" && method === "GET") {
+      return listarAuditoria(env);
+    }
     if (path === "/api/config" && method === "GET") {
       return json(await leerConfig(env));
     }
@@ -438,6 +441,17 @@ async function borrarLote(env, url) {
   ]);
 
   return json({ success: true, id, folios_borrados: folios ? folios.n : 0 });
+}
+
+// ---------- Historial: auditoría de acciones y cambios de estado ----------
+async function listarAuditoria(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT fecha, usuario, accion, folio_afectado FROM auditoria
+     UNION ALL
+     SELECT fecha, cambiado_por AS usuario, 'Estado: ' || COALESCE(estado_anterior, 'nuevo') || ' → ' || estado_nuevo AS accion, folio AS folio_afectado FROM auditoria_estados
+     ORDER BY fecha DESC LIMIT 300`
+  ).all();
+  return json(results);
 }
 
 // ---------- Configuración (precios, promoción, comisión, pruebas, topes) ----------
