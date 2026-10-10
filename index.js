@@ -597,6 +597,8 @@ async function crearVenta(request, env, usuario) {
 
   const v = await env.DB.prepare("SELECT id FROM vendedores WHERE id = ? AND estado = 'activo'").bind(vendedor).first();
   if (!v) return json({ error: "Vendedor no válido o inactivo" }, 400);
+  const adeudo = await env.DB.prepare("SELECT 1 AS x FROM ventas WHERE vendedor_id = ? AND impago = 1 AND estado <> 'anulada' LIMIT 1").bind(vendedor).first();
+  if (adeudo) return json({ error: "El vendedor tiene un adeudo por impago; no puede activar displays nuevos" }, 409);
 
   const marcas = folios.map(() => "?").join(",");
   const { results: fs } = await env.DB.prepare(`SELECT folio, estado, vendedor_id FROM folios WHERE folio IN (${marcas})`).bind(...folios).all();
@@ -678,9 +680,10 @@ async function enviarRevision(env, venta, body) {
 // Marca o desmarca la venta como impagada (retirada por impago). Solo mientras está pendiente o en revisión.
 async function marcarImpago(env, venta, body, usuario) {
   if (body.valor !== 0 && body.valor !== 1) return json({ error: "valor debe ser 0 o 1" }, 400);
-  if (venta.estado !== "pendiente" && venta.estado !== "rev") {
-    return json({ error: "Solo una venta pendiente o en revisión puede marcarse por impago" }, 409);
+  if (body.valor === 1 && !["pendiente", "rev", "cobrada"].includes(venta.estado)) {
+    return json({ error: "Solo una venta pendiente, en revisión o cobrada puede marcarse por impago" }, 409);
   }
+  if (body.valor === 0 && venta.estado === "anulada") return json({ error: "La venta está anulada" }, 409);
   await env.DB.batch([
     env.DB.prepare("UPDATE ventas SET impago = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(body.valor, venta.id),
     env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(
