@@ -28,16 +28,14 @@ const DIGITOS = "23456789";
 const FOLIO_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ][2-9][ABCDEFGHJKLMNPQRSTUVWXYZ][2-9]$/;
 
 const MAX_LOTE = 100;
-// Duración de una prueba, en minutos. Al vencer, el display pasa a libre.
-const PRUEBA_MINUTOS = 30;
 
 // Pasa a libre los displays en prueba vencidos. Se llama antes de leer,
 // así el estado siempre sale correcto sin tarea programada.
-async function aplicarVencimientos(env, usuario, folio) {
+async function aplicarVencimientos(env, usuario, folio, minutos) {
   const filtro = folio
     ? "estado = 'prueba' AND prueba_inicio IS NOT NULL AND folio = ? AND prueba_inicio <= datetime('now', ?)"
     : "estado = 'prueba' AND prueba_inicio IS NOT NULL AND prueba_inicio <= datetime('now', ?)";
-  const corte = `-${PRUEBA_MINUTOS} minutes`;
+  const corte = `-${minutos} minutes`;
   const q = folio
     ? env.DB.prepare(`SELECT folio, estado FROM folios WHERE ${filtro}`).bind(folio, corte)
     : env.DB.prepare(`SELECT folio, estado FROM folios WHERE ${filtro}`).bind(corte);
@@ -129,6 +127,13 @@ async function handleApi(request, env, url) {
       return actualizarFolio(request, env, url, usuario);
     }
 
+    if (path === "/api/config" && method === "GET") {
+      return json(await leerConfig(env));
+    }
+    if (path === "/api/config" && method === "PATCH") {
+      return actualizarConfig(request, env, usuario);
+    }
+
     if (path === "/api/ventas" && method === "GET") {
       return listarVentas(env);
     }
@@ -153,7 +158,7 @@ async function handleApi(request, env, url) {
 }
 
 async function listarFolios(env) {
-  await aplicarVencimientos(env, "sistema", null);
+  await aplicarVencimientos(env, "sistema", null, (await leerConfig(env)).prueba_minutos);
   const { results } = await env.DB.prepare(
     "SELECT folio, estado, negocio_asignado, url_destino, lote_id, vendedor_id, prueba_inicio, created_at, updated_at FROM folios ORDER BY created_at DESC"
   ).all();
@@ -435,22 +440,64 @@ async function borrarLote(env, url) {
   return json({ success: true, id, folios_borrados: folios ? folios.n : 0 });
 }
 
+// ---------- Configuración (precios, promoción, comisión, pruebas, topes) ----------
+const CONFIG_CLAVES = ["precio_display", "promo_n", "promo_precio", "comision_display", "prueba_minutos", "tope_nuevo", "tope_confianza"];
+
+async function leerConfig(env) {
+  const { results } = await env.DB.prepare("SELECT clave, valor FROM config").all();
+  const cfg = {};
+  for (const r of results) cfg[r.clave] = r.valor;
+  for (const k of CONFIG_CLAVES) {
+    if (!(k in cfg)) throw new Error("Falta la configuración: " + k);
+  }
+  return cfg;
+}
+
+async function actualizarConfig(request, env, usuario) {
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  const claves = Object.keys(body);
+  if (claves.length === 0) return json({ error: "Nada que actualizar" }, 400);
+  for (const k of claves) {
+    if (!CONFIG_CLAVES.includes(k)) return json({ error: `Clave no válida: ${k}` }, 400);
+    const v = body[k];
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      return json({ error: `${k} debe ser un número mayor que cero` }, 400);
+    }
+    if (k === "promo_n" && (!Number.isInteger(v) || v < 2)) {
+      return json({ error: "promo_n debe ser un entero de 2 o más" }, 400);
+    }
+    if (k === "prueba_minutos" && (v < 5 || v > 120)) {
+      return json({ error: "prueba_minutos debe estar entre 5 y 120" }, 400);
+    }
+  }
+
+  const stmts = [];
+  for (const k of claves) {
+    stmts.push(
+      env.DB.prepare("UPDATE config SET valor = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE clave = ?").bind(body[k], usuario, k)
+    );
+    stmts.push(
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Config ${k} = ${body[k]}`)
+    );
+  }
+  await env.DB.batch(stmts);
+  return json(await leerConfig(env));
+}
+
 // ---------- Ventas y cortes (bloque 3a) ----------
-// Reglas del panel: display $350 con IVA, promoción de 3 por $900, comisión $150 por display.
+// Precios, promoción y comisión salen de la tabla config (ver leerConfig).
 // La comisión no cambia con la promoción. Al vendedor se le entrega el total menos su comisión.
-const PRECIO_DISPLAY = 350;
-const PROMO_N = 3;
-const PROMO_PRECIO = 900;
-const COMISION_DISPLAY = 150;
 const MAX_VENTA = 50;
 const METODOS = ["efectivo", "transferencia"];
 const FACTURAS = ["no", "pide", "emitida"];
 
-function calcularVenta(n) {
-  const pares = Math.floor(n / PROMO_N);
-  const total = pares * PROMO_PRECIO + (n % PROMO_N) * PRECIO_DISPLAY;
-  const comision = n * COMISION_DISPLAY;
-  return { total, comision, aEntregar: total - comision, enPromo: pares * PROMO_N };
+function calcularVenta(n, cfg) {
+  const pares = Math.floor(n / cfg.promo_n);
+  const total = pares * cfg.promo_precio + (n % cfg.promo_n) * cfg.precio_display;
+  const comision = n * cfg.comision_display;
+  return { total, comision, aEntregar: total - comision, enPromo: pares * cfg.promo_n };
 }
 
 function limpiarTexto(valor, max) {
@@ -498,7 +545,8 @@ async function crearVenta(request, env, usuario) {
   const { results: ocupados } = await env.DB.prepare(`SELECT folio FROM venta_folios WHERE folio IN (${marcas})`).bind(...folios).all();
   if (ocupados.length) return json({ error: "Algún display ya está en otra venta" }, 409);
 
-  const calc = calcularVenta(folios.length);
+  const cfg = await leerConfig(env);
+  const calc = calcularVenta(folios.length, cfg);
   const id = "VN-" + crypto.randomUUID().slice(0, 8);
   const stmts = [
     env.DB.prepare(
@@ -506,9 +554,9 @@ async function crearVenta(request, env, usuario) {
     ).bind(id, vendedor, negocio, limpiarTexto(body.contacto, 120), limpiarWhatsapp(body.whatsapp), body.metodo, calc.total, calc.comision, calc.aEntregar),
   ];
   folios.forEach((folio, i) => {
-    const precio = i < calc.enPromo ? PROMO_PRECIO / PROMO_N : PRECIO_DISPLAY;
+    const precio = i < calc.enPromo ? cfg.promo_precio / cfg.promo_n : cfg.precio_display;
     stmts.push(
-      env.DB.prepare("INSERT INTO venta_folios (folio, venta_id, precio, comision) VALUES (?, ?, ?, ?)").bind(folio, id, precio, COMISION_DISPLAY)
+      env.DB.prepare("INSERT INTO venta_folios (folio, venta_id, precio, comision) VALUES (?, ?, ?, ?)").bind(folio, id, precio, cfg.comision_display)
     );
   });
   stmts.push(
@@ -657,7 +705,7 @@ async function actualizarFolio(request, env, url, usuario) {
     }
   }
 
-  await aplicarVencimientos(env, usuario, folio);
+  await aplicarVencimientos(env, usuario, folio, (await leerConfig(env)).prueba_minutos);
   const actual = await env.DB.prepare("SELECT estado FROM folios WHERE folio = ?").bind(folio).first();
   if (!actual) {
     return json({ error: "Folio no encontrado" }, 404);
@@ -713,7 +761,7 @@ async function handleRedirect(request, env, url) {
     return new Response("Error: El folio no existe.", { status: 404 });
   }
 
-  await aplicarVencimientos(env, "sistema", folio);
+  await aplicarVencimientos(env, "sistema", folio, (await leerConfig(env)).prueba_minutos);
   const display = await env.DB.prepare("SELECT estado, url_destino FROM folios WHERE folio = ?")
     .bind(folio)
     .first();
