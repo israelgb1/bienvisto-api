@@ -1,7 +1,14 @@
 // bienvisto-api: redirector público (ir.bienvisto.com.mx) + API del panel (admini.bienvisto.com.mx/api/*)
-// Versión propuesta. NO desplegada. Pendiente de aprobación.
+// Versión 2: valida el JWT de Cloudflare Access en la API.
 
 const ADMIN_HOST = "admini.bienvisto.com.mx";
+
+// Cloudflare Access: equipo y audiencia de la aplicación "Panel Administrador".
+const ACCESS_ISS = "https://late-tooth-db48.cloudflareaccess.com";
+const ACCESS_AUD = "a5f1705fbfaa8e73babb09229132db7fe09a0dd8807a2581380daecbee4f00fd";
+const LLAVES_TTL_MS = 60 * 60 * 1000;
+let llavesCache = null;
+let llavesCacheAt = 0;
 
 // Catálogo único de estados (en español). Debe coincidir con el panel y con la base.
 const ESTADOS = ["libre", "activo", "pausa", "retirado", "adeudo", "prueba"];
@@ -42,9 +49,8 @@ async function handleApi(request, env, url) {
     return json({ error: "No encontrado" }, 404);
   }
 
-  // Access debe haber autenticado la petición. Sin correo no hay quién escriba.
-  // TODO: validar el JWT (Cf-Access-Jwt-Assertion) contra las llaves del equipo Access.
-  const usuario = request.headers.get("Cf-Access-Authenticated-User-Email");
+  // Identidad verificada por firma del JWT de Access. Sin JWT válido, no hay acceso.
+  const usuario = await verificarAccess(request);
   if (!usuario) {
     return json({ error: "No autorizado" }, 401);
   }
@@ -55,6 +61,13 @@ async function handleApi(request, env, url) {
 
     if (path === "/api/displays" && method === "GET") {
       return listarFolios(env);
+    }
+
+    if (path === "/api/lotes" && method === "GET") {
+      const { results } = await env.DB.prepare(
+        "SELECT id, tipo, costo, destino, nota, cantidad, created_at FROM lotes ORDER BY created_at DESC"
+      ).all();
+      return json(results);
     }
 
     if (path === "/api/displays/batch" && method === "POST") {
@@ -88,6 +101,14 @@ async function generarLote(request, env, usuario) {
     return json({ error: `cantidad debe estar entre 1 y ${MAX_LOTE}` }, 400);
   }
 
+  const tipo = typeof body.tipo === "string" && body.tipo.trim() ? body.tipo.trim().slice(0, 100) : "Reseñas de Google";
+  const costo = body.costo === undefined ? 0 : Number(body.costo);
+  if (!Number.isFinite(costo) || costo < 0 || costo > 100000) {
+    return json({ error: "costo no válido" }, 400);
+  }
+  const destino = typeof body.destino === "string" && body.destino.trim() ? body.destino.trim().slice(0, 200) : null;
+  const nota = typeof body.nota === "string" && body.nota.trim() ? body.nota.trim().slice(0, 300) : null;
+
   const loteId = "LOTE-" + Date.now();
   const generados = [];
   const yaUsados = new Set();
@@ -109,6 +130,11 @@ async function generarLote(request, env, usuario) {
 
   // Todo el lote en una sola transacción: o entran todos o ninguno.
   const stmts = [];
+  stmts.push(
+    env.DB.prepare(
+      "INSERT INTO lotes (id, tipo, costo, destino, nota, cantidad, created_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)"
+    ).bind(loteId, tipo, costo, destino, nota, generados.length)
+  );
   for (const folio of generados) {
     stmts.push(
       env.DB.prepare(
@@ -226,6 +252,76 @@ async function handleRedirect(request, env, url) {
 // ==========================================
 // Utilidades
 // ==========================================
+// Verifica la firma RS256 del JWT de Access y devuelve el correo, o null.
+async function verificarAccess(request) {
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!token) return null;
+
+  const partes = token.split(".");
+  if (partes.length !== 3) return null;
+
+  let header;
+  let payload;
+  try {
+    header = JSON.parse(new TextDecoder().decode(b64uDecode(partes[0])));
+    payload = JSON.parse(new TextDecoder().decode(b64uDecode(partes[1])));
+  } catch {
+    return null;
+  }
+
+  if (header.alg !== "RS256") return null;
+  if (payload.iss !== ACCESS_ISS) return null;
+
+  const audiencias = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  if (!audiencias.includes(ACCESS_AUD)) return null;
+
+  const ahora = Math.floor(Date.now() / 1000);
+  if (typeof payload.exp !== "number" || payload.exp <= ahora) return null;
+
+  const llave = await obtenerLlave(header.kid);
+  if (!llave) return null;
+
+  const firmaValida = await crypto.subtle.verify(
+    { name: "RSASSA-PKCS1-v1_5" },
+    llave,
+    b64uDecode(partes[2]),
+    new TextEncoder().encode(partes[0] + "." + partes[1])
+  );
+  if (!firmaValida) return null;
+
+  return typeof payload.email === "string" && payload.email ? payload.email : null;
+}
+
+async function obtenerLlave(kid) {
+  if (!kid) return null;
+
+  if (!llavesCache || Date.now() - llavesCacheAt > LLAVES_TTL_MS) {
+    const res = await fetch(`${ACCESS_ISS}/cdn-cgi/access/certs`);
+    if (!res.ok) return null;
+    llavesCache = await res.json();
+    llavesCacheAt = Date.now();
+  }
+
+  const jwk = (llavesCache.keys || []).find((k) => k.kid === kid);
+  if (!jwk) return null;
+
+  return crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+}
+
+function b64uDecode(texto) {
+  const b64 = texto.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(texto.length / 4) * 4, "=");
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
 function folioAleatorio() {
   return (
     randomDe(LETRAS) +
