@@ -74,6 +74,10 @@ async function handleApi(request, env, url) {
       return actualizarLote(request, env, url);
     }
 
+    if (path.startsWith("/api/lotes/") && method === "DELETE") {
+      return borrarLote(env, url);
+    }
+
     if (path === "/api/displays/batch" && method === "POST") {
       return generarLote(request, env, usuario);
     }
@@ -181,6 +185,43 @@ async function actualizarLote(request, env, url) {
     .run();
 
   return json({ success: true, id });
+}
+
+// Borra un lote y sus folios solo si ninguno está en uso (todos libres, sin negocio,
+// sin cambios registrados). Todo en una sola transacción.
+async function borrarLote(env, url) {
+  const id = decodeURIComponent(url.pathname.slice("/api/lotes/".length));
+  if (!/^LOTE-\d+$/.test(id)) {
+    return json({ error: "Lote inválido" }, 400);
+  }
+
+  const enUso = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM folios WHERE lote_id = ? AND (estado != 'libre' OR negocio_asignado IS NOT NULL OR url_destino IS NOT NULL)"
+  ).bind(id).first();
+  if (enUso && enUso.n > 0) {
+    return json({ error: "El lote tiene displays en uso. No se puede borrar." }, 409);
+  }
+
+  const movimientos = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM auditoria_estados WHERE estado_anterior IS NOT NULL AND folio IN (SELECT folio FROM folios WHERE lote_id = ?)"
+  ).bind(id).first();
+  if (movimientos && movimientos.n > 0) {
+    return json({ error: "El lote tiene cambios registrados. No se puede borrar." }, 409);
+  }
+
+  const folios = await env.DB.prepare("SELECT COUNT(*) AS n FROM folios WHERE lote_id = ?").bind(id).first();
+  const existeLote = await env.DB.prepare("SELECT id FROM lotes WHERE id = ?").bind(id).first();
+  if ((!folios || folios.n === 0) && !existeLote) {
+    return json({ error: "Lote no encontrado" }, 404);
+  }
+
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM auditoria_estados WHERE folio IN (SELECT folio FROM folios WHERE lote_id = ?)").bind(id),
+    env.DB.prepare("DELETE FROM folios WHERE lote_id = ?").bind(id),
+    env.DB.prepare("DELETE FROM lotes WHERE id = ?").bind(id),
+  ]);
+
+  return json({ success: true, id, folios_borrados: folios ? folios.n : 0 });
 }
 
 async function actualizarFolio(request, env, url, usuario) {
