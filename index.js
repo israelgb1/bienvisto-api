@@ -640,6 +640,7 @@ async function actualizarVenta(request, env, url, usuario) {
   if (!venta) return json({ error: "Venta no encontrada" }, 404);
 
   if (body.accion === "enviar_revision") return enviarRevision(env, venta, body);
+  if (body.accion === "impago") return marcarImpago(env, venta, body, usuario);
   if (body.accion === "cobrar") return cobrarVenta(env, venta, body, usuario);
   if (body.accion === "anular") return anularVenta(env, venta, usuario);
   if (body.accion === "factura") {
@@ -672,6 +673,22 @@ async function enviarRevision(env, venta, body) {
     ),
   ]);
   return json({ success: true, id: venta.id, estado: "rev" });
+}
+
+// Marca o desmarca la venta como impagada (retirada por impago). Solo mientras está pendiente o en revisión.
+async function marcarImpago(env, venta, body, usuario) {
+  if (body.valor !== 0 && body.valor !== 1) return json({ error: "valor debe ser 0 o 1" }, 400);
+  if (venta.estado !== "pendiente" && venta.estado !== "rev") {
+    return json({ error: "Solo una venta pendiente o en revisión puede marcarse por impago" }, 409);
+  }
+  await env.DB.batch([
+    env.DB.prepare("UPDATE ventas SET impago = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(body.valor, venta.id),
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(
+      usuario,
+      `${body.valor ? "Marcó" : "Quitó"} impago en venta ${venta.id}`
+    ),
+  ]);
+  return json({ success: true, id: venta.id, impago: body.valor });
 }
 
 // Cobro desde pendiente o rev. Exige URL de Google válida.
@@ -888,10 +905,35 @@ async function crearSolicitud(request, env, usuario) {
   if (body === null) return json({ error: "JSON inválido" }, 400);
 
   if (!TIPOS_SOLICITUD.includes(body.tipo)) return json({ error: "tipo no válido" }, 400);
-  const folio = typeof body.folio === "string" ? body.folio.toUpperCase() : "";
-  if (!FOLIO_RE.test(folio)) return json({ error: "Folio inválido" }, 400);
   const vendedor = typeof body.vendedor_id === "string" ? body.vendedor_id : null;
   if (!vendedor) return json({ error: "vendedor_id es obligatorio" }, 400);
+  const motivo = limpiarTexto(body.motivo, 200);
+  const nota = limpiarTexto(body.nota, 500);
+  const fotoKey = limpiarTexto(body.foto_key, 300);
+
+  if (body.tipo === "anular") {
+    const ventaId = typeof body.venta_id === "string" ? body.venta_id : "";
+    if (!/^VN-[0-9a-f]{8}$/.test(ventaId)) return json({ error: "venta_id no válido" }, 400);
+    const venta = await env.DB.prepare("SELECT vendedor_id, estado, entregado FROM ventas WHERE id = ?").bind(ventaId).first();
+    if (!venta) return json({ error: "Venta no encontrada" }, 404);
+    if (venta.vendedor_id !== vendedor) return json({ error: "La venta no pertenece a ese vendedor" }, 409);
+    if (!["pendiente", "rev", "cobrada"].includes(venta.estado) || Number(venta.entregado) > 0) {
+      return json({ error: "Esta venta ya no se puede anular" }, 409);
+    }
+    const pend = await env.DB.prepare("SELECT id FROM solicitudes WHERE venta_id = ? AND tipo = 'anular' AND estado = 'pendiente'").bind(ventaId).first();
+    if (pend) return json({ error: "Ya hay una solicitud de anulación pendiente para esa venta" }, 409);
+    const id = "SO-" + crypto.randomUUID().slice(0, 8);
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO solicitudes (id, tipo, venta_id, vendedor_id, motivo, nota, foto_key) VALUES (?, 'anular', ?, ?, ?, ?, ?)"
+      ).bind(id, ventaId, vendedor, motivo, nota, fotoKey),
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Solicitud ${id} (anular venta ${ventaId})`),
+    ]);
+    return json({ success: true, id }, 201);
+  }
+
+  const folio = typeof body.folio === "string" ? body.folio.toUpperCase() : "";
+  if (!FOLIO_RE.test(folio)) return json({ error: "Folio inválido" }, 400);
   const nuevoNegocio = limpiarTexto(body.nuevo_negocio, 200);
   if (body.tipo === "cambiar" && !nuevoNegocio) return json({ error: "nuevo_negocio es obligatorio para cambiar" }, 400);
 
@@ -932,7 +974,19 @@ async function actualizarSolicitud(request, env, url, usuario) {
   }
   if (body.accion !== "aprobar") return json({ error: "accion no válida" }, 400);
 
-  const viejo = await env.DB.prepare("SELECT folio, estado, vendedor_id, url_destino, negocio_asignado FROM folios WHERE folio = ?").bind(s.folio).first();
+  if (s.tipo === "anular") {
+    const venta = await env.DB.prepare("SELECT * FROM ventas WHERE id = ?").bind(s.venta_id).first();
+    if (!venta) return json({ error: "Venta no encontrada" }, 404);
+    // Misma regla que anular desde el panel: solo sin entregas. anularVenta valida estado y entregado.
+    const r = await anularVenta(env, venta, usuario);
+    if (!r.ok) return r;
+    await env.DB.batch([
+      env.DB.prepare("UPDATE solicitudes SET estado = 'aprobada', resuelto_por = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(usuario, id),
+    ]);
+    return json({ success: true, id, estado: "aprobada" });
+  }
+
+  const viejo =await env.DB.prepare("SELECT folio, estado, vendedor_id, url_destino, negocio_asignado FROM folios WHERE folio = ?").bind(s.folio).first();
   if (!viejo || viejo.estado !== "activo") return json({ error: "El display ya no está activo" }, 409);
 
   if (s.tipo === "reponer") {
