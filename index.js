@@ -63,6 +63,22 @@ async function handleApi(request, env, url) {
       return listarFolios(env);
     }
 
+    if (path === "/api/vendedores" && method === "GET") {
+      return listarVendedores(env);
+    }
+
+    if (path === "/api/vendedores" && method === "POST") {
+      return crearVendedor(request, env, usuario);
+    }
+
+    if (path.startsWith("/api/vendedores/") && method === "PATCH") {
+      return actualizarVendedor(request, env, url, usuario);
+    }
+
+    if (path === "/api/displays/asignar" && method === "POST") {
+      return asignarDisplays(request, env, usuario);
+    }
+
     if (path === "/api/lotes" && method === "GET") {
       const { results } = await env.DB.prepare(
         "SELECT id, tipo, costo, destino, nota, cantidad, created_at FROM lotes ORDER BY created_at DESC"
@@ -95,7 +111,7 @@ async function handleApi(request, env, url) {
 
 async function listarFolios(env) {
   const { results } = await env.DB.prepare(
-    "SELECT folio, estado, negocio_asignado, url_destino, lote_id, created_at, updated_at FROM folios ORDER BY created_at DESC"
+    "SELECT folio, estado, negocio_asignado, url_destino, lote_id, vendedor_id, created_at, updated_at FROM folios ORDER BY created_at DESC"
   ).all();
   return json(results);
 }
@@ -158,6 +174,152 @@ async function generarLote(request, env, usuario) {
   await env.DB.batch(stmts);
 
   return json({ success: true, lote_id: loteId, total: generados.length, folios: generados }, 201);
+}
+
+// ---------- Vendedores ----------
+const MAX_ASIGNAR = 50;
+
+async function listarVendedores(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT id, nombre, whatsapp, correo, estado, fecha_registro FROM vendedores ORDER BY fecha_registro DESC"
+  ).all();
+  return json(results);
+}
+
+function limpiarWhatsapp(valor) {
+  if (typeof valor !== "string" || !valor.trim()) return null;
+  return valor.replace(/[^\d+]/g, "").slice(0, 20) || null;
+}
+
+function limpiarCorreo(valor) {
+  if (typeof valor !== "string") return null;
+  const c = valor.trim().toLowerCase().slice(0, 254);
+  if (!c) return null;
+  return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(c) ? c : undefined; // undefined = inválido
+}
+
+async function crearVendedor(request, env, usuario) {
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  const nombre = typeof body.nombre === "string" ? body.nombre.trim().slice(0, 120) : "";
+  if (!nombre) return json({ error: "nombre es obligatorio" }, 400);
+  const whatsapp = limpiarWhatsapp(body.whatsapp);
+  const correo = limpiarCorreo(body.correo);
+  if (correo === undefined) return json({ error: "correo no válido" }, 400);
+
+  const id = "V-" + crypto.randomUUID().slice(0, 8);
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO vendedores (id, nombre, whatsapp, correo, estado) VALUES (?, ?, ?, ?, 'activo')").bind(id, nombre, whatsapp, correo),
+    env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Alta de vendedor ${id} (${nombre})`),
+  ]);
+  return json({ success: true, id }, 201);
+}
+
+async function actualizarVendedor(request, env, url, usuario) {
+  const id = decodeURIComponent(url.pathname.slice("/api/vendedores/".length));
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  const actual = await env.DB.prepare("SELECT id, nombre, whatsapp, correo, estado FROM vendedores WHERE id = ?").bind(id).first();
+  if (!actual) return json({ error: "Vendedor no encontrado" }, 404);
+
+  const nombre = body.nombre !== undefined ? (typeof body.nombre === "string" ? body.nombre.trim().slice(0, 120) : "") : actual.nombre;
+  if (!nombre) return json({ error: "nombre no válido" }, 400);
+  const whatsapp = body.whatsapp !== undefined ? limpiarWhatsapp(body.whatsapp) : actual.whatsapp;
+  const correo = body.correo !== undefined ? limpiarCorreo(body.correo) : actual.correo;
+  if (correo === undefined) return json({ error: "correo no válido" }, 400);
+  const estado = body.estado !== undefined ? body.estado : actual.estado;
+  if (estado !== "activo" && estado !== "inactivo") {
+    return json({ error: "estado no válido" }, 400);
+  }
+
+  const stmts = [];
+  let movidos = 0;
+  let movidosBodega = 0;
+
+  if (estado === "inactivo" && actual.estado !== "inactivo") {
+    // Libres: a destino_libres (otro vendedor activo) o a bodega si no hay destino.
+    // Todos los demás displays del vendedor (no libres): a bodega.
+    const destino = body.destino_libres === undefined || body.destino_libres === null ? null : String(body.destino_libres);
+    if (destino) {
+      if (destino === id) return json({ error: "destino no válido" }, 400);
+      const d = await env.DB.prepare("SELECT id FROM vendedores WHERE id = ? AND estado = 'activo'").bind(destino).first();
+      if (!d) return json({ error: "destino no válido" }, 400);
+    }
+    const cnt = await env.DB.prepare("SELECT COUNT(*) AS n FROM folios WHERE vendedor_id = ? AND estado = 'libre'").bind(id).first();
+    movidos = cnt ? cnt.n : 0;
+    const cntB = await env.DB.prepare("SELECT COUNT(*) AS n FROM folios WHERE vendedor_id = ? AND estado <> 'libre'").bind(id).first();
+    movidosBodega = cntB ? cntB.n : 0;
+    stmts.push(
+      env.DB.prepare("UPDATE folios SET vendedor_id = ?, updated_at = CURRENT_TIMESTAMP WHERE vendedor_id = ? AND estado = 'libre'").bind(destino, id)
+    );
+    stmts.push(
+      env.DB.prepare("UPDATE folios SET vendedor_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE vendedor_id = ? AND estado <> 'libre'").bind(id)
+    );
+    stmts.push(
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(
+        usuario,
+        `Desactivó vendedor ${id}; ${movidos} libres pasaron a ${destino || "bodega"}; ${movidosBodega} no libres pasaron a bodega`
+      )
+    );
+  } else if (estado !== actual.estado) {
+    stmts.push(
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Reactivó vendedor ${id}`)
+    );
+  }
+
+  stmts.push(
+    env.DB.prepare("UPDATE vendedores SET nombre = ?, whatsapp = ?, correo = ?, estado = ? WHERE id = ?").bind(nombre, whatsapp, correo, estado, id)
+  );
+  await env.DB.batch(stmts);
+
+  return json({ success: true, id, estado, displays_movidos: movidos, displays_a_bodega: movidosBodega });
+}
+
+async function asignarDisplays(request, env, usuario) {
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+
+  if (!Array.isArray(body.folios) || body.folios.length === 0 || body.folios.length > MAX_ASIGNAR) {
+    return json({ error: `folios debe tener entre 1 y ${MAX_ASIGNAR} elementos` }, 400);
+  }
+  const folios = body.folios.map((f) => String(f).toUpperCase());
+  if (folios.some((f) => !FOLIO_RE.test(f)) || new Set(folios).size !== folios.length) {
+    return json({ error: "Lista de folios no válida" }, 400);
+  }
+
+  const vendedor = body.vendedor_id === undefined || body.vendedor_id === null ? null : String(body.vendedor_id);
+  if (vendedor) {
+    const v = await env.DB.prepare("SELECT id FROM vendedores WHERE id = ? AND estado = 'activo'").bind(vendedor).first();
+    if (!v) return json({ error: "Vendedor no válido o inactivo" }, 400);
+  }
+
+  const marcas = folios.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(`SELECT folio, estado FROM folios WHERE folio IN (${marcas})`).bind(...folios).all();
+  if (results.length !== folios.length) {
+    return json({ error: "Algún folio no existe" }, 404);
+  }
+  if (results.some((r) => r.estado !== "libre")) {
+    return json({ error: "Solo se asignan displays libres" }, 409);
+  }
+
+  const stmts = [];
+  for (const folio of folios) {
+    stmts.push(
+      env.DB.prepare("UPDATE folios SET vendedor_id = ?, updated_at = CURRENT_TIMESTAMP WHERE folio = ?").bind(vendedor, folio)
+    );
+    stmts.push(
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, ?)").bind(
+        usuario,
+        `Asignó display a ${vendedor || "bodega"}`,
+        folio
+      )
+    );
+  }
+  await env.DB.batch(stmts);
+
+  return json({ success: true, total: folios.length, vendedor_id: vendedor });
 }
 
 async function actualizarLote(request, env, url) {
