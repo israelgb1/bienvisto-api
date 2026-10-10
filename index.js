@@ -441,7 +441,13 @@ async function borrarLote(env, url) {
 }
 
 // ---------- Configuración (precios, promoción, comisión, pruebas, topes) ----------
-const CONFIG_CLAVES = ["precio_display", "promo_n", "promo_precio", "comision_display", "prueba_minutos", "tope_nuevo", "tope_confianza"];
+const CONFIG_CLAVES = [
+  "precio_display", "promo_n", "promo_precio", "comision_display", "prueba_minutos", "tope_nuevo", "tope_confianza",
+  "horas", "recibo_min", "lim_rep", "dias_bono", "lead_d", "colch", "parado_d", "esc_bajo", "bonos_on",
+  "bono1_n", "bono1_b", "bono2_n", "bono2_b", "bono3_n", "bono3_b",
+];
+// Valores que pueden ser 0. El resto debe ser mayor que cero.
+const CONFIG_PUEDE_CERO = ["lim_rep", "recibo_min", "bonos_on"];
 
 async function leerConfig(env) {
   const { results } = await env.DB.prepare("SELECT clave, valor FROM config").all();
@@ -462,8 +468,15 @@ async function actualizarConfig(request, env, usuario) {
   for (const k of claves) {
     if (!CONFIG_CLAVES.includes(k)) return json({ error: `Clave no válida: ${k}` }, 400);
     const v = body[k];
-    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
-      return json({ error: `${k} debe ser un número mayor que cero` }, 400);
+    const minimo = CONFIG_PUEDE_CERO.includes(k) ? 0 : 1;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < minimo) {
+      return json({ error: `${k} no es válido` }, 400);
+    }
+    if (k === "bonos_on" && v !== 0 && v !== 1) {
+      return json({ error: "bonos_on debe ser 0 o 1" }, 400);
+    }
+    if ((k === "bono1_n" || k === "bono2_n" || k === "bono3_n") && !Number.isInteger(v)) {
+      return json({ error: `${k} debe ser un número entero` }, 400);
     }
     if (k === "promo_n" && (!Number.isInteger(v) || v < 2)) {
       return json({ error: "promo_n debe ser un entero de 2 o más" }, 400);
