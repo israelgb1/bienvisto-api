@@ -282,8 +282,8 @@ async function listarFolios(env) {
   await aplicarVencimientos(env, "sistema", null, (await leerConfig(env)).prueba_minutos);
   const { results } = await env.DB.prepare(
     `SELECT f.folio, f.estado, f.negocio_asignado, f.url_destino, f.lote_id, f.vendedor_id, f.prueba_inicio, f.created_at, f.updated_at,
-      (SELECT COUNT(*) FROM escaneos e WHERE e.folio = f.folio AND e.created_at >= datetime('now', '-7 days')) AS esc7,
-      (SELECT COUNT(*) FROM escaneos e WHERE e.folio = f.folio AND e.created_at >= datetime('now', '-30 days')) AS esc30
+      (SELECT COUNT(*) FROM escaneos e WHERE e.folio = f.folio AND e.contado = 1 AND e.created_at >= datetime('now', '-7 days')) AS esc7,
+      (SELECT COUNT(*) FROM escaneos e WHERE e.folio = f.folio AND e.contado = 1 AND e.created_at >= datetime('now', '-30 days')) AS esc30
      FROM folios f ORDER BY f.created_at DESC`
   ).all();
   return json(results);
@@ -410,7 +410,7 @@ const NIVELES = ["nuevo", "confianza"];
 // Escaneos por día de los últimos 30 días (UTC), del más antiguo al más reciente, con ceros donde no hubo.
 async function serieEscaneos(env) {
   const { results } = await env.DB.prepare(
-    "SELECT date(created_at) AS dia, COUNT(*) AS n FROM escaneos WHERE created_at >= datetime('now', '-29 days') GROUP BY dia"
+    "SELECT date(created_at) AS dia, COUNT(*) AS n FROM escaneos WHERE contado = 1 AND created_at >= datetime('now', '-29 days') GROUP BY dia"
   ).all();
   const porDia = new Map(results.map((r) => [r.dia, Number(r.n)]));
   const serie = [];
@@ -1344,7 +1344,7 @@ async function planCobro(env, venta, urlResena, referencia, usuario, cfg) {
   for (const f of fs) {
     stmts.push(
       env.DB.prepare(
-        "UPDATE folios SET estado = 'activo', url_destino = ?, negocio_asignado = ?, direccion = ?, prueba_inicio = NULL, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado IN ('libre','prueba')"
+        "UPDATE folios SET estado = 'activo', url_destino = ?, negocio_asignado = ?, direccion = ?, prueba_inicio = NULL, conteo_desde = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado IN ('libre','prueba')"
       ).bind(urlResena, venta.negocio, venta.direccion || null, f.folio),
       env.DB.prepare("INSERT INTO auditoria_estados (folio, estado_anterior, estado_nuevo, cambiado_por) VALUES (?, ?, 'activo', ?)").bind(f.folio, f.estado, usuario)
     );
@@ -1665,7 +1665,7 @@ async function crearSolicitud(request, env, usuario, vendedorSesion = null) {
         ).bind(id, body.tipo, folio, vendedor, motivoLimpio, notaLimpia, nuevoNegocio, urlResena, fotoLimpia);
       if (body.tipo === "cambiar") {
         await env.DB.batch([
-          env.DB.prepare("UPDATE folios SET url_destino = ?, negocio_asignado = ?, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'activo'").bind(urlResena, nuevoNegocio, folio),
+          env.DB.prepare("UPDATE folios SET url_destino = ?, negocio_asignado = ?, conteo_desde = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'activo'").bind(urlResena, nuevoNegocio, folio),
           registro(),
           env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, ?)").bind(usuario, `Cambio de negocio directo ${folio} → ${nuevoNegocio} (${id})`, folio),
         ]);
@@ -1757,7 +1757,7 @@ async function actualizarSolicitud(request, env, url, usuario) {
   if (!esUrlResena(url_resena)) return json({ error: "La solicitud no tiene una URL https de Google válida" }, 400);
   await env.DB.batch([
     env.DB.prepare(
-      "UPDATE folios SET url_destino = ?, negocio_asignado = ?, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'activo'"
+      "UPDATE folios SET url_destino = ?, negocio_asignado = ?, conteo_desde = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE folio = ? AND estado = 'activo'"
     ).bind(url_resena, s.nuevo_negocio, s.folio),
     env.DB.prepare("UPDATE solicitudes SET estado = 'aprobada', resuelto_por = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(usuario, id),
     env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, ?)").bind(usuario, `Cambio de negocio ${s.folio} → ${s.nuevo_negocio} (solicitud ${id})`, s.folio),
@@ -1867,6 +1867,50 @@ async function actualizarFolio(request, env, url, usuario) {
 // 2. REDIRECTOR PÚBLICO (ir.bienvisto.com.mx)
 // Solo GET/HEAD. No lee query strings para decidir nada.
 // ==========================================
+// Agentes que no son una persona escaneando: robots, vistas previas de mensajería, herramientas de línea de comandos.
+const BOT_RE = /bot|crawl|spider|slurp|preview|facebookexternalhit|whatsapp|telegram|slack|discord|skype|linkedin|twitter|curl|wget|python|java\/|go-http|okhttp|axios|node-fetch|headless|lighthouse|monitor|uptime|pingdom|google-read-aloud|bingpreview/i;
+
+async function hashHex(texto) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(texto));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+}
+
+function tipoDispositivo(ua) {
+  if (/iphone|ipad|ipod/i.test(ua)) return "ios";
+  if (/android/i.test(ua)) return "android";
+  if (/windows|macintosh|linux|cros/i.test(ua)) return "escritorio";
+  return "otro";
+}
+
+// Guarda cada visita con su detalle y decide si cuenta: solo displays activos, personas (no robots),
+// y una vez por día por dispositivo. La IP nunca se guarda; solo un hash que cambia cada día.
+async function registrarEscaneo(env, request, url, folio, estado) {
+  const ua = request.headers.get("User-Agent") || "";
+  const ip = request.headers.get("CF-Connecting-IP") || "";
+  const cf = request.cf || {};
+  const dia = new Date(Date.now() - 6 * 3600 * 1000).toISOString().slice(0, 10);
+  const esBot = !ua || BOT_RE.test(ua) ? 1 : 0;
+  const huella = await hashHex(`${env.HUELLA_SALT || "bv"}|${dia}|${folio}|${ip}|${ua}`);
+
+  let motivo = null;
+  if (esBot) motivo = "bot";
+  else if (estado === "prueba") motivo = "prueba";
+  else if (estado !== "activo") motivo = "no_activo";
+  else {
+    const previo = await env.DB.prepare(
+      "SELECT 1 AS x FROM escaneos WHERE folio = ? AND dia_mx = ? AND huella = ? AND contado = 1 LIMIT 1"
+    ).bind(folio, dia, huella).first();
+    if (previo) motivo = "repetido";
+  }
+
+  await env.DB.prepare(
+    "INSERT INTO escaneos (folio, dia_mx, huella, origen, dispositivo, pais, region, ciudad, estado_display, es_bot, contado, motivo_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(
+    folio, dia, huella, url.searchParams.get("q") === "1" ? "qr" : "nfc", tipoDispositivo(ua),
+    cf.country || null, cf.region || null, cf.city || null, estado, esBot, motivo ? 0 : 1, motivo
+  ).run();
+}
+
 async function handleRedirect(request, env, url) {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Método no permitido", { status: 405, headers: { Allow: "GET, HEAD" } });
@@ -1891,7 +1935,7 @@ async function handleRedirect(request, env, url) {
 
   if (request.method === "GET") {
     try {
-      await env.DB.prepare("INSERT INTO escaneos (folio) VALUES (?)").bind(folio).run();
+      await registrarEscaneo(env, request, url, folio, display.estado);
     } catch (err) {
       console.error("escaneo no registrado", err);
     }
@@ -3318,7 +3362,7 @@ async function vendedorDisplays(env, vendedor) {
   const cfg = await leerConfig(env);
   await aplicarVencimientos(env, "sistema", null, cfg.prueba_minutos);
   const { results } = await env.DB.prepare(
-    "SELECT folio, estado, negocio_asignado, prueba_inicio, url_destino, direccion, (SELECT COUNT(*) FROM escaneos e WHERE e.folio = folios.folio AND e.created_at >= datetime('now', '-7 days')) AS escaneos_7d, (SELECT v.id FROM venta_folios vf JOIN ventas v ON v.id = vf.venta_id WHERE vf.folio = folios.folio AND v.estado NOT IN ('anulada', 'rechazada') ORDER BY v.created_at DESC LIMIT 1) AS venta_id, (SELECT v.estado FROM venta_folios vf JOIN ventas v ON v.id = vf.venta_id WHERE vf.folio = folios.folio AND v.estado NOT IN ('anulada', 'rechazada') ORDER BY v.created_at DESC LIMIT 1) AS venta_estado FROM folios WHERE vendedor_id = ? ORDER BY folio"
+    "SELECT folio, estado, negocio_asignado, prueba_inicio, url_destino, direccion, (SELECT COUNT(*) FROM escaneos e WHERE e.folio = folios.folio AND e.contado = 1 AND e.created_at >= datetime('now', '-7 days')) AS escaneos_7d, (SELECT v.id FROM venta_folios vf JOIN ventas v ON v.id = vf.venta_id WHERE vf.folio = folios.folio AND v.estado NOT IN ('anulada', 'rechazada') ORDER BY v.created_at DESC LIMIT 1) AS venta_id, (SELECT v.estado FROM venta_folios vf JOIN ventas v ON v.id = vf.venta_id WHERE vf.folio = folios.folio AND v.estado NOT IN ('anulada', 'rechazada') ORDER BY v.created_at DESC LIMIT 1) AS venta_estado FROM folios WHERE vendedor_id = ? ORDER BY folio"
   ).bind(vendedor.id).all();
   const ahora = Date.now();
   const displays = results.map((d) => {
@@ -3351,7 +3395,7 @@ async function vendedorDesempeno(env, vendedor) {
     "SELECT COUNT(*) AS n FROM venta_folios vf JOIN ventas v ON v.id = vf.venta_id WHERE v.vendedor_id = ? AND v.estado IN ('pendiente','rev','cobrada')"
   ).bind(vendedor.id).first();
   const escaneos = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM escaneos e JOIN folios f ON f.folio = e.folio WHERE f.vendedor_id = ? AND e.created_at >= datetime('now', '-7 days')"
+    "SELECT COUNT(*) AS n FROM escaneos e JOIN folios f ON f.folio = e.folio WHERE f.vendedor_id = ? AND e.contado = 1 AND e.created_at >= datetime('now', '-7 days')"
   ).bind(vendedor.id).first();
   const conteo = await env.DB.prepare(
     "SELECT SUM(CASE WHEN estado = 'activo' THEN 1 ELSE 0 END) AS activos, SUM(CASE WHEN estado = 'libre' THEN 1 ELSE 0 END) AS libres FROM folios WHERE vendedor_id = ?"
@@ -3496,7 +3540,7 @@ async function vendedorHistorial(env, vendedor, folio) {
   const dias = [];
   for (let i = 6; i >= 0; i--) dias.push(new Date(hoyMx.getTime() - i * 86400000).toISOString().slice(0, 10));
   const { results: porDia } = await env.DB.prepare(
-    "SELECT date(created_at, '-6 hours') AS dia, COUNT(*) AS n FROM escaneos WHERE folio = ? AND created_at >= datetime('now', '-8 days') GROUP BY dia"
+    "SELECT date(created_at, '-6 hours') AS dia, COUNT(*) AS n FROM escaneos WHERE folio = ? AND contado = 1 AND created_at >= datetime('now', '-8 days') GROUP BY dia"
   ).bind(folio).all();
   const mapa = Object.fromEntries(porDia.map((r) => [r.dia, Number(r.n) || 0]));
   const escaneos_por_dia = dias.map((dia) => ({ dia, n: mapa[dia] || 0 }));
