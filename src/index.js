@@ -166,6 +166,13 @@ async function handleApi(request, env, url) {
       return actualizarVendedor(request, env, url, usuario);
     }
 
+    if (path === "/api/altas-vendedor" && method === "GET") {
+      return listarAltasVendedor(env);
+    }
+    if (path.startsWith("/api/altas-vendedor/") && method === "PATCH") {
+      return resolverAltaVendedor(request, env, url, usuario);
+    }
+
     if (path === "/api/cuentas-cobro/aprobar" && method === "POST") {
       return resolverCambioCuenta(request, env, usuario, true);
     }
@@ -513,6 +520,61 @@ async function crearVendedor(request, env, usuario) {
     env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Alta de vendedor ${id} (${nombre})`),
   ]);
   return json({ success: true, id }, 201);
+}
+
+// ---------- Solicitudes de alta de vendedor (formulario de bienvisto.com.mx/vendedores) ----------
+async function listarAltasVendedor(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT id, nombre, whatsapp, correo, zona, invito, estado, vendedor_id, motivo_rechazo, resuelto_por, resolved_at, created_at FROM altas_vendedor ORDER BY created_at DESC LIMIT 200"
+  ).all();
+  return json(results || []);
+}
+
+async function resolverAltaVendedor(request, env, url, usuario) {
+  const id = decodeURIComponent(url.pathname.slice("/api/altas-vendedor/".length));
+  if (!/^AV-[0-9a-f]{8}$/.test(id)) return json({ error: "Solicitud inválida" }, 400);
+  const body = await leerJson(request);
+  if (body === null) return json({ error: "JSON inválido" }, 400);
+  const alta = await env.DB.prepare("SELECT * FROM altas_vendedor WHERE id = ?").bind(id).first();
+  if (!alta) return json({ error: "Solicitud no encontrada" }, 404);
+  if (alta.estado !== "pendiente") return json({ error: "La solicitud ya fue resuelta" }, 409);
+
+  if (body.accion === "rechazar") {
+    const motivo = typeof body.motivo === "string" ? body.motivo.trim().slice(0, 300) : "";
+    await env.DB.batch([
+      env.DB.prepare("UPDATE altas_vendedor SET estado = 'rechazada', motivo_rechazo = ?, resuelto_por = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(motivo || null, usuario, id),
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Rechazó la solicitud de vendedor ${id} (${alta.nombre})`),
+    ]);
+    return json({ success: true });
+  }
+
+  if (body.accion === "aprobar") {
+    if (await correoVendedorUsado(env, alta.correo, null)) return json({ error: "Ese correo ya es de otro vendedor" }, 409);
+    const vid = "V-" + crypto.randomUUID().slice(0, 8);
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO vendedores (id, nombre, whatsapp, correo, nivel, estado) VALUES (?, ?, ?, ?, 'nuevo', 'activo')").bind(vid, alta.nombre, limpiarWhatsapp(alta.whatsapp), alta.correo),
+      env.DB.prepare("UPDATE altas_vendedor SET estado = 'aprobada', vendedor_id = ?, resuelto_por = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'").bind(vid, usuario, id),
+      env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Aprobó la solicitud de vendedor ${id}: alta de ${vid} (${alta.nombre})`),
+    ]);
+    return json({ success: true, vendedor_id: vid });
+  }
+  return json({ error: "accion debe ser aprobar o rechazar" }, 400);
+}
+
+// Guarda la solicitud para que aparezca en el panel. Si la base falla, el correo sale de todos modos.
+// Devuelve { id } si es nueva, { id, repetida: true } si ese correo ya tenía una pendiente, o null si no se pudo guardar.
+async function registrarAltaVendedor(env, d) {
+  try {
+    const previa = await env.DB.prepare("SELECT id FROM altas_vendedor WHERE lower(correo) = lower(?) AND estado = 'pendiente' LIMIT 1").bind(d.correo).first();
+    if (previa) return { id: previa.id, repetida: true };
+    const id = "AV-" + crypto.randomUUID().slice(0, 8);
+    await env.DB.prepare("INSERT INTO altas_vendedor (id, nombre, whatsapp, correo, zona, invito) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(id, d.nombre, d.whatsapp || null, d.correo, d.zona || null, d.invito || null).run();
+    return { id };
+  } catch (e) {
+    console.log("altas_vendedor: no se pudo guardar " + (e && e.message));
+    return null;
+  }
 }
 
 async function actualizarVendedor(request, env, url, usuario) {
@@ -1886,7 +1948,7 @@ async function permisosRequeridos(request, env, url, method, path) {
   if (method === "GET") {
     if (path === "/api/escaneos/serie" || path === "/api/pruebas/resumen") return sin(["ver_resumen"]);
     if (path === "/api/displays" || path === "/api/lotes") return sin(["ver_inventario"]);
-    if (path === "/api/vendedores" || path === "/api/solicitudes" || path === "/api/cuentas-cobro") return sin(["ver_vendedores"]);
+    if (path === "/api/vendedores" || path === "/api/solicitudes" || path === "/api/cuentas-cobro" || path === "/api/altas-vendedor") return sin(["ver_vendedores"]);
     if (path === "/api/ventas" || path === "/api/cortes" || path === "/api/avisos-entrega" || path === "/api/precios" || /^\/api\/ventas\/[^/]+\/comprobante$/.test(path) || /^\/api\/avisos-entrega\/[^/]+\/comprobante$/.test(path)) return sin(["ver_cobros"]);
     // Ajustes y Precios necesitan la configuración; cada sección se revisa en la UI y el PATCH se revisa por campo.
     if (path === "/api/config") return sin([], ["precios_venta", "costos_impuestos", "reglas_vendedores", "ver_cobros"]);
@@ -1911,6 +1973,7 @@ async function permisosRequeridos(request, env, url, method, path) {
   if (path === "/api/displays/alta" || path === "/api/displays/batch" || path === "/api/lotes") return sin(["inventario_registrar"]);
   if (path === "/api/displays/asignar" || path.startsWith("/api/displays/") || path.startsWith("/api/lotes/")) return sin(["inventario_editar"]);
   if (path.startsWith("/api/vendedores")) return sin(["vendedores_gestionar"]);
+  if (path.startsWith("/api/altas-vendedor/")) return sin(["vendedores_gestionar"]);
   if (path.startsWith("/api/cuentas-cobro/")) return sin(["solicitudes_resolver"]);
   if (path.startsWith("/api/solicitudes/") && method === "PATCH") {
     const b = await cuerpo();
@@ -2141,7 +2204,7 @@ export async function generarDocumentacion(env) {
   add("**Estados de una venta**", "");
   add("- `pendiente`: creada. Los displays están reservados para ella.", "- `rev`: el vendedor avisó que ya cobró y el panel debe revisarla.", "- `cobrada`: cobro confirmado. Los displays están activos. Se programa el recibo al cliente.", "- `entregada`: su saldo a entregar quedó cubierto por cortes.", "- `anulada`: cancelada. Anular una venta cobrada devuelve sus displays a `libre`.", "- `rechazada`: la página de pago la contempla, pero ningún flujo la asigna a una venta.", "");
   add("**Otros estados**", "");
-  add("- Solicitudes (reponer, cambiar, anular): `pendiente` → `aprobada` o `rechazada`.", "- Cuentas de cobro: `pendiente` → `vigente` (aprobada, reemplaza a la anterior, que queda `sustituida`) o `rechazada`. Una `pendiente` puede `cancelarse`.", "- Avisos de entrega: `pendiente` → `confirmado` (crea un corte) o `rechazado`. `confirmando` es un estado transitorio durante la confirmación.", "- Envíos (correos): `pendiente` → `enviado` o `sin_correo` si fallan. Se reintentan hasta 5 veces.", "- Vendedores: `activo` o `inactivo`. Un vendedor inactivo con ventas abiertas no se puede desactivar.", "");
+  add("- Solicitudes (reponer, cambiar, anular): `pendiente` → `aprobada` o `rechazada`.", "- Cuentas de cobro: `pendiente` → `vigente` (aprobada, reemplaza a la anterior, que queda `sustituida`) o `rechazada`. Una `pendiente` puede `cancelarse`.", "- Avisos de entrega: `pendiente` → `confirmado` (crea un corte) o `rechazado`. `confirmando` es un estado transitorio durante la confirmación.", "- Envíos (correos): `pendiente` → `enviado` o `sin_correo` si fallan. Se reintentan hasta 5 veces.", "- Solicitudes de alta de vendedor (formulario del sitio): `pendiente` → `aprobada` (crea al vendedor en nivel nuevo) o `rechazada`.", "- Vendedores: `activo` o `inactivo`. Un vendedor inactivo con ventas abiertas no se puede desactivar.", "");
   add("**Reposiciones y cambios**", "");
   add("Un vendedor de confianza cambia el negocio de un display directo, sin aprobación. También repone directo hasta lim_rep veces al mes. Lo demás pasa como solicitud que el panel aprueba o rechaza.", "");
 
@@ -3880,17 +3943,34 @@ async function handleFormulario(request, env, url) {
     }
   }
 
+  let alta = null;
+  if (tipo === "vendedor") {
+    alta = await registrarAltaVendedor(env, datos);
+    // Ese correo ya tiene una solicitud pendiente: no se repite el aviso.
+    if (alta && alta.repetida) return jsonSitio(request, { ok: true });
+  }
+
   const filas = def.campos.filter(([c]) => datos[c]).map(([c, etiqueta]) => [etiqueta, datos[c]]);
   const cuando = new Date().toLocaleString("es-MX", { timeZone: "America/Mexico_City" });
   const texto = filas.map(([e, v]) => `${e}: ${v}`).join("\n") + `\n\nEnviado desde bienvisto.com.mx el ${cuando}.` + (adjuntos.length ? "\nLa constancia va adjunta." : "");
   const html = `<table style="border-collapse:collapse;font:15px/1.5 Arial,sans-serif">${filas.map(([e, v]) => `<tr><td style="padding:6px 12px 6px 0;color:#3F544E;vertical-align:top;white-space:nowrap"><b>${esc(e)}</b></td><td style="padding:6px 0;white-space:pre-wrap">${esc(v)}</td></tr>`).join("")}</table><p style="font:13px Arial,sans-serif;color:#6B897E">Enviado desde bienvisto.com.mx el ${esc(cuando)}.${adjuntos.length ? " La constancia va adjunta." : ""}</p>`;
 
+  let textoCorreo = texto;
+  let htmlCorreo = html;
+  if (alta) {
+    const panel = "https://" + ADMIN_HOST;
+    const tel = String(datos.whatsapp || "").replace(/\D/g, "");
+    const wa = tel.length === 10 ? "https://wa.me/52" + tel : "";
+    textoCorreo = texto + `\n\nRevísala y apruébala en el panel: ${panel}` + (wa ? `\nEscribirle por WhatsApp: ${wa}` : "");
+    htmlCorreo = html + `<p style="font:15px Arial,sans-serif;margin-top:16px"><a href="${esc(panel)}" style="background:#0E6B5C;color:#fff;padding:10px 18px;border-radius:999px;text-decoration:none;font-weight:bold">Revisar en el panel</a>` + (wa ? ` &nbsp; <a href="${esc(wa)}" style="color:#0E6B5C;font-weight:bold">Escribirle por WhatsApp</a>` : "") + `</p>`;
+  }
+
   const correo = {
     from: REMITENTE_SITIO,
     to: [CORREO_CONTACTO],
     subject: def.asunto(datos).slice(0, 180),
-    text: texto,
-    html,
+    text: textoCorreo,
+    html: htmlCorreo,
   };
   const responder = def.responderA(datos);
   if (responder) correo.reply_to = responder;
