@@ -827,8 +827,8 @@ const IVA_TASA_MAX = 30;
 
 // Valores opcionales: si nunca se han guardado, costo_produccion es null (se usa el promedio de lotes) e isr_tasa es 1.
 async function leerConfigAdmin(env) {
-  const { results } = await env.DB.prepare("SELECT clave, valor FROM config WHERE clave IN ('costo_produccion', 'isr_tasa', 'iva_tasa', 'referidos_on')").all();
-  const out = { costo_produccion: null, isr_tasa: 1, iva_tasa: 16, referidos_on: 0 };
+  const { results } = await env.DB.prepare("SELECT clave, valor FROM config WHERE clave IN ('costo_produccion', 'isr_tasa', 'iva_tasa', 'referidos_on', 'seguimiento_on')").all();
+  const out = { costo_produccion: null, isr_tasa: 1, iva_tasa: 16, referidos_on: 0, seguimiento_on: 1 };
   for (const r of results) out[r.clave] = r.valor;
   return out;
 }
@@ -872,6 +872,13 @@ async function actualizarConfig(request, env, usuario) {
     if (v !== 0 && v !== 1) return json({ error: "referidos_on debe ser 0 o 1" }, 400);
     admin.referidos_on = v;
     delete body.referidos_on;
+  }
+  // Interruptor general del seguimiento de 90 días: encendido por defecto. Apagado, las ventas nuevas no crean resúmenes.
+  if ("seguimiento_on" in body) {
+    const v = Number(body.seguimiento_on);
+    if (v !== 0 && v !== 1) return json({ error: "seguimiento_on debe ser 0 o 1" }, 400);
+    admin.seguimiento_on = v;
+    delete body.seguimiento_on;
   }
   if ("iva_tasa" in body) {
     const v = Number(body.iva_tasa);
@@ -3209,7 +3216,7 @@ function reciboCorreo(venta, folios, vendedor) {
     n ? "Displays activos (" + n + "): " + folios.join(", ") : null,
     "",
     "Soporte y garantía: bienvisto.com.mx/soporte",
-    venta.consent_seguimiento_at ? "Seguimiento incluido: cada 15 días, durante 90 días, te mandaremos por WhatsApp un resumen del uso de tu display. Si no quieres recibirlo, responde BAJA." : null,
+    venta.consent_seguimiento_at ? "Seguimiento incluido: cada 15 días, durante tres meses, te mandaremos por WhatsApp un resumen del uso de tu display. Si no quieres recibirlo, responde BAJA." : null,
     "¿Necesitas factura? Pídela en bienvisto.com.mx/factura con la referencia " + venta.id + ".",
     "",
     "Este recibo no es una factura. Si pagaste una cantidad distinta, responde a este correo y lo revisamos.",
@@ -3258,7 +3265,7 @@ function reciboCorreo(venta, folios, vendedor) {
     '<tr><td bgcolor="#FFFFFF" style="padding:32px;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:#12302B;">' +
     '<p style="margin:0;">¿Necesitas factura? Pídela en <a href="https://bienvisto.com.mx/factura" style="color:#0E6B5C;font-weight:bold;text-decoration:underline;">bienvisto.com.mx/factura</a> con la referencia ' + esc(venta.id) + ".</p>" +
     '<p style="margin:8px 0 0 0;">Soporte y garantía: <a href="https://bienvisto.com.mx/soporte" style="color:#0E6B5C;text-decoration:underline;">bienvisto.com.mx/soporte</a></p>' +
-    (venta.consent_seguimiento_at ? '<p style="margin:8px 0 0 0;">Seguimiento incluido: cada 15 días, durante 90 días, te mandaremos por WhatsApp un resumen del uso de tu display. Si no quieres recibirlo, responde BAJA.</p>' : "") +
+    (venta.consent_seguimiento_at ? '<p style="margin:8px 0 0 0;">Seguimiento incluido: cada 15 días, durante tres meses, te mandaremos por WhatsApp un resumen del uso de tu display. Si no quieres recibirlo, responde BAJA.</p>' : "") +
     "</td></tr>" +
     '<tr><td bgcolor="#0E6B5C" style="padding:24px 32px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#FBF6EC;">' +
     '<p style="margin:0;color:#FBF6EC;">Este recibo no es una factura. Si pagaste una cantidad distinta, responde a este correo y lo revisamos.</p>' +
