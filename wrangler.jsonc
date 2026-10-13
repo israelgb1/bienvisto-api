@@ -3,6 +3,12 @@
   "name": "bienvisto-api",
   "main": "src/index.js",
   "compatibility_date": "2026-06-01",
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "admini.bienvisto.com.mx/api/*", "zone_name": "bienvisto.com.mx" },
+    { "pattern": "vendedores.bienvisto.com.mx/api/*", "zone_name": "bienvisto.com.mx" },
+    { "pattern": "ir.bienvisto.com.mx", "custom_domain": true, "zone_name": "bienvisto.com.mx" }
+  ],
   "d1_databases": [
     { "binding": "DB", "database_name": "bienvisto-db", "database_id": "54820915-65d0-4d64-a16e-d04421b5a4af" }
   ],
@@ -10,6 +16,5 @@
     { "binding": "COMPROBANTES", "bucket_name": "bienvisto-comprobantes" }
   ],
   "triggers": { "crons": ["*/5 * * * *"] }
-  // PENDIENTE: "routes" (admini., vendedores., ir., bienvisto.com.mx). Copiarlas del dashboard antes del primer despliegue.
   // Secretos y variables viven en Cloudflare, no aquí: RESEND_API_KEY, GOOGLE_PLACES_KEY, GOOGLE_CLIENT_ID.
 }
