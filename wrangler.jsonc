@@ -15,6 +15,6 @@
   "r2_buckets": [
     { "binding": "COMPROBANTES", "bucket_name": "bienvisto-comprobantes" }
   ],
-  "triggers": { "crons": ["*/5 * * * *"] }
+  "triggers": { "crons": ["* * * * *"] }
   // Secretos y variables viven en Cloudflare, no aquí: RESEND_API_KEY, GOOGLE_PLACES_KEY, GOOGLE_CLIENT_ID.
 }
