@@ -2025,7 +2025,7 @@ const DOC_CONFIG_DESC = {
   tope_nuevo: "Exposición máxima de un vendedor nuevo: saldo pendiente más ventas en revisión (MXN).",
   tope_confianza: "Exposición máxima de un vendedor de confianza (MXN). Nunca menor que tope_nuevo.",
   horas: "Horas que tiene el vendedor para entregar el saldo de su venta cobrada más antigua. Si vence, no puede activar displays nuevos.",
-  recibo_min: "Minutos entre el cobro y el correo de recibo al cliente. El envío corre cada 5 minutos, así que en la práctica tarda entre ese tiempo y 10 minutos.",
+  recibo_min: "Minutos entre el cobro y el correo de recibo al cliente. El envío corre cada minuto, así que en la práctica sale entre ese tiempo y 1 minuto después.",
   lim_rep: "Reposiciones directas al mes para vendedores de confianza. Con 0, todas pasan como solicitud al panel.",
   bonos_on: "Interno. 1 = bonos activos, 0 = apagados.",
   dias_bono: "Interno. Días de la ventana de bonos. El código no lo describe más: confirmar con el dueño.",
@@ -2181,7 +2181,7 @@ export async function generarDocumentacion(env) {
   add("**Enlaces públicos**", "");
   add("- `ir.bienvisto.com.mx/<folio en minúsculas>` redirige a la reseña del negocio que tiene el display activo. Si el display está libre, muestra una página de disponibilidad.", "- `/pago/VN-xxxxxxxx` muestra al cliente el monto y los datos de cobro de su venta. Si la venta ya está pagada o cancelada, lo dice.", "");
   add("**Correos**", "");
-  add("- Recibo al cliente: sale recibo_min minutos después del cobro.", "- Comprobante al vendedor: sale cuando una venta queda entregada, es decir, cuando su saldo queda cubierto.", "- Los correos se envían desde Resend. El envío corre cada 5 minutos y toma hasta 25 pendientes por corrida.", "");
+  add("- Recibo al cliente: sale recibo_min minutos después del cobro.", "- Comprobante al vendedor: sale cuando una venta queda entregada, es decir, cuando su saldo queda cubierto.", "- Los correos se envían desde Resend. El envío corre cada minuto y toma hasta 25 pendientes por corrida.", "");
 
   // ---------- 7 ----------
   add("## 7. Permisos del panel", "");
@@ -2193,7 +2193,7 @@ export async function generarDocumentacion(env) {
 
   // ---------- 8 ----------
   add("## 8. Infraestructura y servicios", "");
-  add("- **Cloudflare Workers**: `bienvisto-api` es la API del panel, la API de la app de vendedores, los formularios del sitio y el envío de correos (cron cada 5 minutos). `bienvisto-publico` sirve el sitio y lee los valores de la API.", "- **Cloudflare D1**: base `bienvisto-db`. Es la única fuente de datos.", "- **Cloudflare R2**: bucket `bienvisto-comprobantes` para comprobantes de cobro y de avisos de entrega.", "- **Cloudflare Access**: aplicación \"Panel Administrador\" sobre admini.bienvisto.com.mx. Identidad por Google (Instant Auth).", "- **Google Cloud**: dos clientes OAuth. Uno para la entrada de vendedores (Google Identity) y otro para el inicio de sesión del panel vía Access.", "- **Resend**: correos transaccionales. Remitentes vendedores@ y sitio@ dentro de bienvisto.com.mx.", "- **Google Places**: búsqueda de negocios, calificaciones y fotos para los vendedores.", "");
+  add("- **Cloudflare Workers**: `bienvisto-api` es la API del panel, la API de la app de vendedores, los formularios del sitio y el envío de correos (cron cada minuto). `bienvisto-publico` sirve el sitio y lee los valores de la API.", "- **Cloudflare D1**: base `bienvisto-db`. Es la única fuente de datos.", "- **Cloudflare R2**: bucket `bienvisto-comprobantes` para comprobantes de cobro y de avisos de entrega.", "- **Cloudflare Access**: aplicación \"Panel Administrador\" sobre admini.bienvisto.com.mx. Identidad por Google (Instant Auth).", "- **Google Cloud**: dos clientes OAuth. Uno para la entrada de vendedores (Google Identity) y otro para el inicio de sesión del panel vía Access.", "- **Resend**: correos transaccionales. Remitentes vendedores@ y sitio@ dentro de bienvisto.com.mx.", "- **Google Places**: búsqueda de negocios, calificaciones y fotos para los vendedores.", "");
   add("Secretos y variables. Sus valores no están en este archivo. Aquí se muestra solo si están configurados:", "");
   add("- Base de datos (DB): " + (env.DB ? "configurada" : "NO configurada"));
   add("- Comprobantes (COMPROBANTES): " + (env.COMPROBANTES ? "configurado" : "NO configurado"));
@@ -2833,7 +2833,7 @@ async function cobrarVendedor(request, env, venta, vendedor) {
 
 // ==========================================
 // ENVÍO DE CORREOS: recibo al cliente y comprobante al vendedor (Resend)
-// Cron cada 5 minutos: scheduled() llama enviarPendientes().
+// Cron cada minuto: scheduled() llama enviarPendientes().
 // ==========================================
 const fmtMXN = (n) => new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN" }).format(Number(n) || 0);
 
