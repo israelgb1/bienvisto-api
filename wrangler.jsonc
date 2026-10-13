@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bienvisto-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-01",
+  "d1_databases": [
+    { "binding": "DB", "database_name": "bienvisto-db", "database_id": "54820915-65d0-4d64-a16e-d04421b5a4af" }
+  ],
+  "r2_buckets": [
+    { "binding": "COMPROBANTES", "bucket_name": "bienvisto-comprobantes" }
+  ],
+  "triggers": { "crons": ["*/5 * * * *"] }
+  // PENDIENTE: "routes" (admini., vendedores., ir., bienvisto.com.mx). Copiarlas del dashboard antes del primer despliegue.
+  // Secretos y variables viven en Cloudflare, no aquí: RESEND_API_KEY, GOOGLE_PLACES_KEY, GOOGLE_CLIENT_ID.
+}
