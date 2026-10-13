@@ -2837,31 +2837,99 @@ async function cobrarVendedor(request, env, venta, vendedor) {
 // ==========================================
 const fmtMXN = (n) => new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN" }).format(Number(n) || 0);
 
+// Logo de Bien Visto (isologo de color, PNG de 400 px) que va adjunto en línea al recibo.
+// Los clientes de correo no cargan imágenes externas de forma confiable; así el logo siempre se ve.
+const LOGO_CORREO_ID = "logo-bienvisto";
+const LOGO_CORREO_B64 = "iVBORw0KGgoAAAANSUhEUgAAAZAAAABYCAMAAADsrVGTAAAAkFBMVEX////+//////b//fT9/fz/+vD9+e/89+379+379u379uz79uv79ev69ev59ev59Or49Or38+ns7uXM3NLssTzypxvnpB6fwbZvpJhhkXA9hnYhdmYTbl8SbV4RbV4RbV0RbFwQbV4QbF0PbF0QbFsPa1wOa10Oa1wOa1sNa1wLalsJaFkFZlgCZFQAYlMAYVFx21SpAAAVHElEQVR42u1d6XaruLJOIOAc34YwrA6YQScR4XIRAt7/7W6VJAYx2I4z/bHW6t57J2iqTzWX4OHhTHt8wv8/hVEUJ0mSZtW93dSyFMgXR1Eo6fn4cFsTHUPAIuNt2/KG1XfS3tZq1ggSZoBKOB70G+AIoqTue84oeae0KO+UvbWVBaXvhDLe93USBTdAgs+Hcda3FSH0jsR34UIJqdo+i0NF4msb4hcmvGM5vVPxuxvNWceT8DO6RMDRtpTcWeNnGIXQthWQXMseQcxbYK57+7FGSMvj4ComAdSitC/ucPw0JEWfRlcwydPDU9w1d4/jN7yTpoufLiHyBNqjJ3dV/jvqnfSgSZ4u4JG1d/b4PSZps7OIPD1ETZPf6fR7LW9YtI8I4NHWd23+u7qdtbuIAB59cVcfv61Iin4HEeSP8o7H7yNSbvMI6HPG7nj8BSKMbWj2x4cgbd7u1PmL9takwcPjMl7ylHR3++qvbK0ueVpEUZ4e4l73PwryLf7hx9tuhPLK0OVfRzh/Y/6sj3WhBQqEF0tzrOPVVyH5KBvOtiGhpK5IcdksLOryL6POMP9vxPUKrqkRFFhcm5a2aRInjL9/UTiyNE05+9jAo2lp1V20ImjLs6arir/ijrJrYP6fT5aSVhNa6IFk+u/jwDTtMOFf4ZE3nr7+++/ra8ZWG6I8jcIwypoLpG5PYRDGjP0NIgXjMc7P6/LnhdbM9n18DDJty6Q9mZbnvRhged1Oio8G8YD2+rHcUMHS0LCsp7A+K6JpGxumZRoR+yMGaSI5P6c/j30WPD7ONHq++KXlH49H34ja2wVoyV7/RURe/z3xhUFNutjwXdc34nPjv/HEdD3Hg8e6v4jogJwwfJjfM5P2x+fPJ70ODPKmHVQQaJYLeBxdK9gQN1cLrNO/qr2uAGkj0zsePSM6R2nSRQaeC88MOf0TQMQqLy3zu4w5OrDIkkHw/IqFHB37dplV1m+vEyAfNwIi1uGa4Z/ILMpDCYj5C4BMLII+us4GKFC+DMiMQTZE1pWAxMbXJecXOERxKMzf//z8JVP+OppYefXdgHywdGKQldy7DpCiSQPT93zbSv5EZFGePNswv+WnzeX5y/LLLCINrcfH5Xa/A5A3/rrPIFcCgsosMEzDjdv3vxBZqNV9mD84XWZQSlhNiq/ij64IOOlNWX03IOCCjHi8lnV1GyDon8ZRnLR/FYWmbQLzp+3FqCv4uVnWNV9bZ9mgu75S6ZuAfJYf0eTdZ5AVICXFtjEHafq24xuglQUlhBbngk8FjnnroVWDEN63faPNL4bVflCUBPzcIIzShpRFsfbrr1yJUutPKwGtA0IIKWrGKppfz5Jzjb4ysZaA0JxidTjnjK5LV/OszFdVFwUhNdaTc1asepCCYfCJwp8cBm3oTjksPLQfpCIVU0TPsjKbz08Iw1GrfKAFKRljXPm5tGHY5gOXhFRirQ30LS/KLNAhAa3PiSzWdF1TZFnN4c8ryxlLlk0MkjZnAckK3nNxgSLN2p4vQswYy2JtuSAl61qKPZIMDnCxCMJh8IkS3qlBYfStgwQypm7anRNWtCzj4pgWONwkMQvadhmOWveMjPOlKQNz0EE/t06hZXzsUeas62qx1rTuOpYXZz0FGgAg0SoPMgeEoBQPwyAIw+iUti2ln2SQDYE1BwQYAy9NBAfrEAQorjXyURnL4nNE8qbDJQWWZXkgJpKmm0GiOrTwSBiAeebDP9JuXUkjY2n6wLPQK0awUHDIv8UDfUnTJlHgW7YYFc87xQegoXWMBnIgWjhoPTg62QnW6liWA2s9ZR07d6TzLgJAVipEAyQOfdMwYfMW/BFEScsvp7E+mplG33T1J0D6U+jC+PbROR5gCj9Kuqnw5b09mTD3PMBCqw7EtWFAD9fFHnYYN+OaZAfTiCKwjqzD0ZFjpkvTQcbSzO3IDUZMYFI/4ZmMpZnqMcKzyDSsg3O0wfSKW9Ad4gFoBwnIwRLNtBOMk5eky+LQxLU60McCAsZZd0ZuoRIBFbKyYUZAoJnmwfNcbPCHbVqwuYuIfJw1eWeAuGYUmeYRRnYQfpjiYLhRPtC3rFho+o5/AE02KNmmiQPDUj2Ojuc5phkmncy5qA6ea5o2/EY9cQC7taPlOpbm/cfdcHAoeD8Hz0FvtEoDG+a3wqKWXBUarieX6lvw+0LO5ziuotbRdbBhX4pn5wSwvwxrhe1ZRnjq9rNMYNQ9PWwYtnNA3OEvcncOnIzuwg2eN55MDFKfjRL9j2U68wmAaY5GmLb56BjCcTw61hDcI0gTW5J67OGZz7CmYtbh6GmP+JYZd//dCMpsmt2kj3D3rhUynshz7wvxBVxl+uOgrgf8VWWBrS1G/c4OgQysiUzLc7VfeJYZNbtZIFz/Q0jq6gwgy+bZsDk6c0/LtcE4M3mTTQYZATk663l8M0gkIrg+3K87ACLw8FcU8J6NuHufdVgRyF3EizEoImZ+TpY5OOAD//mo9FsiRNHBQ0DeWxlIgTW78sSDYGpgPZ434u94oiGH5KyMDNddLQXGLXYRqUn4sBHrPweItrmPD8bqt7Mm79tZDplOuYcicTjQgcxfLgEBYTKeUVf0UIRwPLkmHRDPk/8J4llaBB0MTDGZZ0bLIMCAlQPkngOCcRQxtHswLcdRkDUJKCtotpzSMkUzgqR54wq/ESa1MECLl7uGb/SwEbc7CwhsDngkl/EqMC1LrueYLpq8a0C8IxgMpmGYShb7ZigSZgtAUEOoPQLrG9gFFNy0JqIB4h4N0wblexRjvlihZl3MyK7vfw5VNgdk7GH6YYiKXRrtYHaFYICKacEGwn/AP1OedQMejloraD5nQGQvPgF0eYivAATP4iQMHVCyyFYfPH2FdmIaIhdN3iUgQMznMIYWhZb6oVryApAh+AuksMDgwy5hoAjuogtLZ4C8mC5ero+jZ+tFDqkJLRRMh61Uy/uwMhBmc0De6yLEJBGolpQ38fPB910T7CEKDg9vpNpBo7Hh0LomG1JKxxfbkGsF29B+USpmL+EFVtsVgOABhmaNAtEXOc0xnquRXTd593LRM0CcgxklvO+6vmcJWDFyySJHpwOC/5JCwxPmI3YBb8KSGxch+gmQFzS9gFRdl4Tmi8i1hdpq8vHAa5FD0ia2M+Sk6AwQIod2QMH3Oe1jOPUys0sJpVk7ANJmGCUhlGWhPAie6YPLgmsF18iXm/asMN+mzFWAeKYdRnh+wWQYOAYphMbtGpHLJq8OiHNw45bTPCd5XrZglyiBEYLtpwMyZCdQmmTgKOeE5LTpk0DuHI90PgACeGRtBqQiWZeGtit+pFF+MMhcmGnG4UNO6tmXamMEJOeJdxCP1+/gYICkgmO0EICT0TZSEDaSqrUS1qdy8ONuThoBObXnlTosAZzhvu+KUzicaiAJ/++U8HitRrw1jc4uJkeh2ad+DMjkVR+J8yws3XcNkHIidsSbTE1IM0DkeTjT2fDMs5sM946ybnbmdSdMbPJl0IhD8np6WAdEyDhQExkDpAnv+4lwK0CqUsg3dTCUW1Hg9RyxPdBo9Y4jcroECPhubVvkcIKrTg0nLPO0YemaFcq6umjyaoC8GFrFJC3acEpja4AMi8I8f5UBP8kGLBCbzhh3kx0w5zoRmYtlL7UFuBWBLZXCFMwrGzE9asmGaoAQLPwQHBX3GNXMspxUe4BQhasDjDa/kAaaxRen5x97O6WAgJwXWbC18UZu1rwNiKCZ+f62TgleivIuAQFq6LWahCdC2Qoy0TkgdOgCLNWCTB5b2w+Z91PLFCBzkaB24y7srJFF4OEheITFBC/yOOCPqGb2qvmf7Sg+JVnXzuLpS0CUbymG1kLV2WxOcosOEfF3OgNY2TBoFOZrc2pu8r6m7DIgM2IsfjNTpAKQHNUkSgE7iJctEr9AcrCFJzkr2XAs4KBCt8+l3WSPpTV1NfxEhC+obvbG6jSapmVjVK8he4AUShNp1BvCMvaZOpqLgOBRmUH8DhOp+qCw+L+1w3GVyauR3d9IHw/nfVQJSN9MsQ4SxNCaaVj/KP3JtwE54aLX2c8ctvkyPxV5p/OMBghApnQoegCWYYGzQbYBKZV4Q1X7vlnIsmLXGSDReQ7RZN0UBsbjpsknBEQzed/OFXQNwcW1/UdV/AiljgaIEsvSrdebMpWtkDSfAUSQWDEE8s7IMkM1mgaIrFZzx6iea4QjIgtABt3nrY0p9eRebhwdw7OhE9vX+mGJqYzjHEQhxiJPe53Jq0V7VwVX883ogKipdxueOv4ZQJYqY6ZUpEmgAyLIYvuzmFs4DLgAZPQ6twCRc6xFwxg6ORdcXG4CAFH+JwDCqRbW/ah1k7e8UBNoSEDqawHpvh8QmGwyqoq12bUABEuNA+MwhqVkkH0LkOZWQOos3A6/n5T+Gpayg9Si1udjplPOMsiwg41SVSodsHMiy/U2m2+H783nANHcjrljQqotQGCoJAow6CZjIC9mIkOTuyIr2gdkq9RLhN83ElTDQlAtaRgP8QbUIUhJrRouvSLKu4ztHdw9pY4z7yn1nfbwSaWuO+bgVwnXHYMECzpMxzLnmD6OABVX2Zp0W6kLZbRhS6lQmaBfsZ2g2kjhTiEhGHKm80VVvKvcd7E5zax6u87k1ci+NNSnTMVxZfaKuZ0Ns3dogqifAgTcHltZk7xdBbfWgFSUNB04hql0yA5qyJVjyOf+5dLslQEbXuykcFeFpMphlQLbsU4TxQa3RqpBcRbmFdXXavSZYELLqC6WjqGj7ELNMVRqB0OlPe82G/+syBqVGUbCVF5qdqpXgOAb+gqSk7wd6HoSCKwdw8E8iPYcw81qYSwmfXgI1vcayUh5NAm7jBRVWeSkP9mD1TccozmLzEzeyzeOmIR8seTzoRMVtgUjNSNjy6Cpv9Li04CM6Q8jWidIFoAURdu1ZSEJqxCINUAGMN/Bg/7nXOhEhOq2ivOwDGhdKCeqjBXpX6wg6dqmqpuujcXh1e+NzEsUr2aQGeSuBSJzO7ioAzIYQRhcZHwI2Iko3+igfR6QSUQeDgqYWYWLBkjBmgSlIlWFKRogo6pWBRrqvGH2ZB5cTGW0ASNG9V6h3EYp6aTsBCJulKSMpnFoHgbXbLLn5kW8o8n7cbFSaFRTzvNz3PFChN+r7srwuwxpQ5+Ct0kcp4NZcgMgwmeYpeHdWZJdA6RgJALLISJYWbXkEOUkoZZvMljWaI6+4FobGX5veqV69sLvspR0o9h6dodK5UKDMPRN0x3szvne5qbvVSbvrBBH+phWlEilgAF+lWYTIlGnryjPcccEVdv3fdck0X8Mwx/CPzcAgnJ7yjXohuoilhU9gXENDwA4faKSKXKekk2pgawHgUJqqmiPa00xGNq3aRzIjNKLFeZbfpostn543JBZU4mFGBQLsg7euGwN4Lnpe5XJqw5zTRQTOq5pqxSuOaVw8dAv6JuvUrhReDSOnm8NSvcWQOhQOqRk/owWWvgdSGwLUzZKWZmEljbkyL0uLuyUottk7qdwzc37Deo6wsaFHbU1y5sVNsy8ZN8I52UTC73+ml53KxGY8PnZ1YochlCRb8rg0pK+BZ8VDogQo3n05lUDtwAyRkzWSaxFPkTJf1HkMPiTSlgiqnIzoqIhOLXzIgdbbM+0LxQ5jBd2HhZx6YFenr1ZeiJiOHReIvz2+jmNPgZbzWdv7nxfLANiZaiX1rhDMuALgBSDvFn5DbrIGmSGh2VA7lGv6poKMHBh4spVs18G1GxdBh+vtG2r9SrrTq7lb+ERpPqFDY1FrjF5JzVib8xwplDuvclCw1uFtEYRehMgY9R9lZ3RlfooMwZxoZ30iXvVgjJWbxbKuUZUs2L/dsjw3oByY51JsNq958yizlOlyevnGWScQWND50IpaVNFhuXr5ZkgQlUcYt1hiog69pYgUAEIoR5WTwypgKOvwu/2LNjrwLRsOnxFzSLDmfKsHb56PzJXa7XMiG8WLpazNwdss0gF/igWp05lso7nmHZEVxea3qY8yGvzUV3fMpwBi62dodjaNp6jaiq2bkSx9YxQlGHE1XL0YutUaeKNDgIlH4unt6MVo7zBEukFGeQLFLCnCP8CqwXmiyy29rDYOtPkG2sirFSGlakXImCxNazVnYqtXVFsvf3avtmLA5BFNg9P3nBwPkxLhVcxTRYmXU0374O8ni1V3OORhp9CD68jHI4HG/RhEM0neAcHdXFroKBY4m+JywbH4TpC877fQXpxpmV4yf6rdFj4ZNsGGKPFMoGHtxssZRQBjyA5DmLeIF4UTQP9k9AWtxOeZJqnJHhNxZzWaoW71xFQk42v1li/fGaYg3YEzDVLpkoxkczbretIo17/jMBSM7Q8wTsv7hFv38Rpx+cLpnhBJjxpRztnPUmiMPDBMQ7COGHzI7fVoSrhXIXRmavVYCRFQRCtI+IFx/s/Yzw85/wUwcTyGtDyhaElaeXlIyC7QpawPj+JtWKfKCH93oUd7eUz4vVM28WNpO7wRU1RBKY0llrsXMv7YOXp9fU15R/VZxuh45U22nbN8kob5zlf5AeKvIYH5ZW2pucVudShKromb89ddadNm6Z8I0OBV+pmw9GibTN5UW6LsqTgfUuzuhs5TayVySttrGvrvStti9czbbzAbIIdxHbXo1vcsv0rhmXNG8ZvwAN3KS59ct7UZL1eSjdeIFaSvGRYRLt16XOrAynq83fxCsrY5hMwHNUuMhCcuCl2KAt7qZn2YjZYayXXWua7l6f+d/ECs32hJRZLRFna+S/tlG9l9XYTHqK3uDe8PX65R8Lti9Q7HS7a4sXedcxyY61nr26W22s91ydbvbv3/hLMv2xZlzwuPyUiXhN7f834nzSy8ZpYoUbq+4uU/6JRVofbr7aOvv4a0nv7PB5Vu//y9/vL+H8fj92X8avPVdwR+V086vb8B0TuH3T51ZY3TXT+Ezthfv/k0S/auxc+eXT/KNjviqvLHwW7fzbvN9njms/mDR+WrO4+4k97g9V1H5ZUn15lHb1D8pNw0I5d+enV4ePE/P5x4p9qJSlafv3HibXPd98x+X40Pv/57gf5sPjAfZ3fP3D/fWBQktfqA/ePn/nA/QBJECVF33NGyTst7rB8BYqCvmMdSt/TJApugGOABDCJk0y85ZSx+k7Y21rNmHhTbJbEiMZtcEhdImpNwwhQSdP0HlS5NUACxMPChPBpJOpu+38Ya0EsTM2I/AAAAABJRU5ErkJggg==";
+
+function fechaLarga(valor) {
+  const d = new Date(String(valor || "").replace(" ", "T") + "Z");
+  if (isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("es-MX", { day: "numeric", month: "long", year: "numeric", timeZone: "America/Mexico_City" }).format(d);
+}
+
 function reciboCorreo(venta, folios, vendedor) {
   const primer = String(venta.contacto || "").trim().split(/\s+/)[0] || "";
   const nombreVend = vendedor ? vendedor.nombre : "tu vendedor";
-  const pago = venta.metodo === "transferencia"
-    ? "Transferencia a " + nombreVend + " (vendedor de Bien Visto)" + (venta.referencia ? " · clave de rastreo " + venta.referencia : "")
-    : "Efectivo, recibido por " + nombreVend + " (vendedor de Bien Visto)";
+  const transferencia = venta.metodo === "transferencia";
+  const pagoTxt = transferencia
+    ? "Transferencia a " + nombreVend + (venta.referencia ? " (clave de rastreo " + venta.referencia + ")" : "")
+    : "Efectivo, recibido por " + nombreVend;
   const n = folios.length;
+  const fecha = fechaLarga(venta.fecha_cobro || venta.created_at);
+  const saludo = (primer ? "Hola " + primer + ", tu" : "Tu") + (n > 1 ? " display ya está activo." : " display ya está activo.");
+
   const lineas = [
-    "Hola " + primer + ", gracias por tu compra en Bien Visto.",
+    saludo + " Cada vez que alguien lo escanee, llega directo a la página para dejar una reseña en Google.",
     "",
     "Recibo " + venta.id,
-    "• Display Bien Visto (" + folios.join(", ") + ") · " + venta.negocio,
-    n > 1 ? "• Cantidad: " + n + " displays" : null,
-    "• Total: " + fmtMXN(venta.total) + " (IVA incluido)",
-    "• Pago: " + pago,
+    "Total pagado: " + fmtMXN(venta.total) + " (IVA incluido)",
+    "Negocio: " + venta.negocio,
+    fecha ? "Fecha: " + fecha : null,
+    "Forma de pago: " + pagoTxt,
+    n ? "Displays activos (" + n + "): " + folios.join(", ") : null,
     "",
-    "Tu display ya está activo: cada escaneo lleva a dejar una reseña en Google.",
     "Soporte y garantía: bienvisto.com.mx/soporte",
-    "¿Necesitas factura? Pídela aquí: bienvisto.com.mx/factura (usa la referencia " + venta.id + ")",
+    "¿Necesitas factura? Pídela en bienvisto.com.mx/factura con la referencia " + venta.id + ".",
     "",
     "Este recibo no es una factura. Si pagaste una cantidad distinta, responde a este correo y lo revisamos.",
   ].filter((x) => x !== null);
   const texto = lineas.join("\n");
-  const html = lineas.map((l) => (l === "" ? "<br>" : "<p>" + esc(l) + "</p>")).join("");
-  return { asunto: "Tu recibo de Bien Visto · " + venta.id, texto, html };
+
+  const fila = (k, v, ultima) =>
+    '<tr><td width="150" valign="top" style="padding:12px 0;border-top:1px solid #DDE7E2;' + (ultima ? "border-bottom:1px solid #DDE7E2;" : "") + 'color:#5C7069;">' + esc(k) + '</td>' +
+    '<td valign="top" style="padding:12px 0;border-top:1px solid #DDE7E2;' + (ultima ? "border-bottom:1px solid #DDE7E2;" : "") + '">' + v + '</td></tr>';
+  const filas = [
+    fila("Negocio", esc(venta.negocio), false),
+    fecha ? fila("Fecha", esc(fecha), false) : "",
+    fila("Forma de pago", transferencia
+      ? "Transferencia" + (venta.referencia ? '<br><span style="font-size:13px;color:#5C7069;">Clave de rastreo ' + esc(venta.referencia) + "</span>" : "")
+      : "Efectivo", false),
+    fila("Atendió", esc(nombreVend), true),
+  ].join("");
+  const lista = n
+    ? '<tr><td bgcolor="#FFFFFF" style="padding:32px 32px 0 32px;font-family:Arial,Helvetica,sans-serif;">' +
+      '<p style="margin:0 0 12px 0;font-size:15px;line-height:20px;font-weight:bold;color:#12302B;">Displays activos (' + n + ")</p>" +
+      '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">' +
+      folios.map((f, i) => '<tr><td style="padding:10px 0;border-top:1px solid #DDE7E2;' + (i === n - 1 ? "border-bottom:1px solid #DDE7E2;" : "") + "font-family:'Courier New',Courier,monospace;font-size:15px;color:#12302B;\">" + esc(f) + "</td></tr>").join("") +
+      "</table></td></tr>"
+    : "";
+
+  const html =
+    '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Recibo de Bien Visto</title></head>' +
+    '<body style="margin:0;padding:0;background:#F3F1EC;">' +
+    '<div style="display:none;max-height:0;overflow:hidden;color:#F3F1EC;mso-hide:all;">Recibo ' + esc(venta.id) + " por " + esc(fmtMXN(venta.total)) + ". Tu display ya está activo.</div>" +
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#F3F1EC" style="background:#F3F1EC;"><tr><td align="center" style="padding:24px 12px;">' +
+    '<table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" bgcolor="#FFFFFF" style="width:600px;max-width:600px;background:#FFFFFF;">' +
+    '<tr><td bgcolor="#FFFFFF" style="padding:28px 32px 24px 32px;border-bottom:1px solid #DDE7E2;font-family:Arial,Helvetica,sans-serif;">' +
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr>' +
+    '<td valign="middle" align="left"><img src="cid:' + LOGO_CORREO_ID + '" width="200" height="44" alt="Bien Visto" style="display:block;border:0;outline:none;text-decoration:none;width:200px;height:44px;"></td>' +
+    '<td valign="middle" align="right" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#5C7069;">Recibo<br><span style="font-size:15px;font-weight:bold;color:#12302B;">' + esc(venta.id) + "</span></td>" +
+    "</tr></table></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:32px 32px 0 32px;font-family:Arial,Helvetica,sans-serif;">' +
+    '<p style="margin:0;font-size:13px;line-height:18px;color:#5C7069;">Total pagado</p>' +
+    '<p style="margin:6px 0 0 0;font-size:40px;line-height:44px;font-weight:bold;color:#12302B;">' + esc(fmtMXN(venta.total)) + "</p>" +
+    '<p style="margin:6px 0 0 0;font-size:13px;line-height:18px;color:#5C7069;">IVA incluido</p></td></tr>' +
+    '<tr><td bgcolor="#FFFFFF" style="padding:24px 32px 0 32px;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:24px;color:#12302B;"><p style="margin:0;">' +
+    esc(saludo) + " Cada vez que alguien lo escanee, llega directo a la página para dejar una reseña en Google.</p></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:28px 32px 0 32px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:22px;color:#12302B;">' +
+    filas + "</table></td></tr>" +
+    lista +
+    '<tr><td bgcolor="#FFFFFF" style="padding:32px;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:#12302B;">' +
+    '<p style="margin:0;">¿Necesitas factura? Pídela en <a href="https://bienvisto.com.mx/factura" style="color:#0E6B5C;font-weight:bold;text-decoration:underline;">bienvisto.com.mx/factura</a> con la referencia ' + esc(venta.id) + ".</p>" +
+    '<p style="margin:8px 0 0 0;">Soporte y garantía: <a href="https://bienvisto.com.mx/soporte" style="color:#0E6B5C;text-decoration:underline;">bienvisto.com.mx/soporte</a></p></td></tr>' +
+    '<tr><td bgcolor="#0E6B5C" style="padding:24px 32px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#FBF6EC;">' +
+    '<p style="margin:0;color:#FBF6EC;">Este recibo no es una factura. Si pagaste una cantidad distinta, responde a este correo y lo revisamos.</p>' +
+    '<p style="margin:8px 0 0 0;color:#FBF6EC;"><a href="https://bienvisto.com.mx/privacidad" style="color:#FBF6EC;text-decoration:underline;">Aviso de privacidad</a> &nbsp;|&nbsp; <a href="https://bienvisto.com.mx/terminos-clientes" style="color:#FBF6EC;text-decoration:underline;">Términos</a></p>' +
+    '<p style="margin:8px 0 0 0;color:#E7F0EC;">Bien Visto · bienvisto.com.mx</p></td></tr>' +
+    '<tr><td bgcolor="#F2A71B" style="font-size:0;line-height:4px;height:4px;">&nbsp;</td></tr>' +
+    "</table></td></tr></table></body></html>";
+  return {
+    asunto: "Tu recibo de Bien Visto · " + venta.id,
+    texto,
+    html,
+    adjuntos: [{ filename: "logo-bienvisto.png", content: LOGO_CORREO_B64, content_type: "image/png", content_id: LOGO_CORREO_ID }],
+  };
 }
 
 function comprobanteCorreo(venta, folios, vendedor) {
@@ -2884,6 +2952,8 @@ function comprobanteCorreo(venta, folios, vendedor) {
 async function enviarEnvio(env, e) {
   const venta = await env.DB.prepare("SELECT * FROM ventas WHERE id = ?").bind(e.venta_id).first();
   if (!venta) return { estado: "error", error: "venta no encontrada" };
+  // Si la venta se anuló o rechazó después de programar el correo, ya no se envía (sus folios ya no existen).
+  if (venta.estado === "anulada" || venta.estado === "rechazada") return { estado: "omitido", error: "venta " + venta.estado };
   const vendedor = await env.DB.prepare("SELECT nombre, correo FROM vendedores WHERE id = ?").bind(venta.vendedor_id).first();
   const destino = e.destinatario === "cliente" ? venta.correo : (vendedor && vendedor.correo);
   if (!destino) return { estado: "sin_correo", error: "sin correo de destino" };
@@ -2893,7 +2963,7 @@ async function enviarEnvio(env, e) {
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from: "Bien Visto <vendedores@bienvisto.com.mx>", to: [destino], subject: msg.asunto, text: msg.texto, html: msg.html }),
+    body: JSON.stringify({ from: "Bien Visto <vendedores@bienvisto.com.mx>", to: [destino], subject: msg.asunto, text: msg.texto, html: msg.html, ...(msg.adjuntos ? { attachments: msg.adjuntos } : {}) }),
     signal: AbortSignal.timeout(10000),
   });
   if (res.ok) return { estado: "enviado" };
@@ -2914,8 +2984,8 @@ async function enviarPendientes(env) {
     }
     if (r.estado === "enviado") {
       await env.DB.prepare("UPDATE envios SET estado = 'enviado', enviado_at = CURRENT_TIMESTAMP, intentos = intentos + 1, error = NULL WHERE id = ?").bind(e.id).run();
-    } else if (r.estado === "sin_correo") {
-      await env.DB.prepare("UPDATE envios SET estado = 'sin_correo', error = ? WHERE id = ?").bind(r.error, e.id).run();
+    } else if (r.estado === "sin_correo" || r.estado === "omitido") {
+      await env.DB.prepare("UPDATE envios SET estado = ?, error = ? WHERE id = ?").bind(r.estado, r.error, e.id).run();
     } else {
       const intentos = e.intentos + 1;
       await env.DB.prepare("UPDATE envios SET intentos = ?, estado = ?, error = ? WHERE id = ?")
