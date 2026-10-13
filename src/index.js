@@ -3368,7 +3368,7 @@ async function vendedorDesempeno(env, vendedor) {
 
 async function vendedorSolicitudes(env, vendedor) {
   const { results } = await env.DB.prepare(
-    "SELECT id, tipo, folio, venta_id, estado, nuevo_negocio, motivo_rechazo, created_at, resolved_at FROM solicitudes WHERE vendedor_id = ? ORDER BY created_at DESC LIMIT 200"
+    "SELECT id, tipo, folio, venta_id, estado, nuevo_negocio, motivo_rechazo, created_at, resolved_at, (resuelto_por = 'directo') AS directo FROM solicitudes WHERE vendedor_id = ? ORDER BY created_at DESC LIMIT 200"
   ).bind(vendedor.id).all();
   return json({ solicitudes: results });
 }
