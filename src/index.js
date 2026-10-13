@@ -2596,7 +2596,7 @@ export async function generarDocumentacion(env) {
   add("**Cambiar una regla de vendedores** (topes, plazos, pruebas, reposiciones, bonos)", "");
   add("Ajustes > Reglas, con el permiso reglas_vendedores. Las restricciones de la sección 4 se revisan al guardar. Si una combinación rompe una regla, el panel muestra el error y no guarda nada.", "");
   add("**Agregar una clave de configuración**", "");
-  add("1. Agregarla a CONFIG_CLAVES en el worker, y decidir si es de precios, costos o reglas en GRUPO_CONFIG.", "2. Validarla en actualizarConfig, con sus reglas entre campos si aplican.", "3. Si la app de vendedores o el sitio la necesitan, agregarla a su lista pública (CLAVES_PUBLICAS) o a la configuración del vendedor.", "4. Agregar el campo en Ajustes del panel y su descripción en DOC_CONFIG_DESC.", "");
+  add("1. Agregarla a CONFIG_CLAVES en el worker, y decidir si es de precios, costos o reglas en GRUPO_CONFIG.", "2. Validarla en actualizarConfig, con sus reglas entre campos si aplican.", "3. Si la app de vendedores o el sitio la necesitan, agregarla a su lista pública (CLAVES_PUBLICAS) o a la configuración del vendedor.", "4. Agregar el campo en Ajustes del panel y su descripción en DOC_CONFIG_DESC.", "5. Si la regla aparece en el manual del vendedor (bienvisto.com.mx/ayuda/manual), agregarla a RESPALDO y textos() en bienvisto-publico/worker/index.js y usarla en worker/ayuda-contenido.js; así el manual y su PDF se actualizan solos.", "");
   add("**Agregar un permiso**", "");
   add("Agregarlo a PERMISOS, a PERMISOS_ASIGNABLES (automático), a permisosRequeridos para las rutas que lo usen, y a la interfaz del panel. Sumar su descripción en DOC_PERMISOS_DESC.", "");
   add("**Cambiar el código**", "");
