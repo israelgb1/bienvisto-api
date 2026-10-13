@@ -3891,6 +3891,47 @@ function base64DeBytes(bytes) {
   return btoa(bin);
 }
 
+// Acuse para quien pidió ser vendedor: mismo marco que los recibos.
+function solicitudRecibidaCorreo(d) {
+  const primer = String(d.nombre || "").trim().split(/\s+/)[0] || "";
+  const saludo = (primer ? "Hola " + primer + ", recibimos" : "Recibimos") + " tu solicitud para vender con Bien Visto.";
+  const cuerpo = "Está en revisión. Te escribiremos lo antes posible.";
+  const texto = [saludo, cuerpo, "", d.nombre ? "Nombre: " + d.nombre : null, d.zona ? "Zona: " + d.zona : null, d.whatsapp ? "WhatsApp: " + d.whatsapp : null, "", "Si algún dato está mal, responde a este correo.", "Bien Visto · bienvisto.com.mx"].filter((x) => x !== null).join("\n");
+  const fila = (k, v, ultima) =>
+    '<tr><td width="140" valign="top" style="padding:12px 0;border-top:1px solid #DDE7E2;' + (ultima ? "border-bottom:1px solid #DDE7E2;" : "") + 'color:#5C7069;">' + esc(k) + '</td>' +
+    '<td valign="top" style="padding:12px 0;border-top:1px solid #DDE7E2;' + (ultima ? "border-bottom:1px solid #DDE7E2;" : "") + '">' + esc(v) + '</td></tr>';
+  const datos = [["Nombre", d.nombre], ["Zona", d.zona], ["WhatsApp", d.whatsapp]].filter(([, v]) => v);
+  const filas = datos.map(([k, v], i) => fila(k, v, i === datos.length - 1)).join("");
+  const html =
+    '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Solicitud recibida</title></head>' +
+    '<body style="margin:0;padding:0;background:#F3F1EC;">' +
+    '<div style="display:none;max-height:0;overflow:hidden;color:#F3F1EC;mso-hide:all;">Recibimos tu solicitud. Está en revisión y te escribiremos lo antes posible.</div>' +
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#F3F1EC" style="background:#F3F1EC;"><tr><td align="center" style="padding:24px 12px;">' +
+    '<table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" bgcolor="#FFFFFF" style="width:600px;max-width:600px;background:#FFFFFF;">' +
+    '<tr><td bgcolor="#FFFFFF" style="padding:28px 32px 24px 32px;border-bottom:1px solid #DDE7E2;font-family:Arial,Helvetica,sans-serif;">' +
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr>' +
+    '<td valign="middle" align="left"><img src="cid:' + LOGO_CORREO_ID + '" width="200" height="44" alt="Bien Visto" style="display:block;border:0;outline:none;text-decoration:none;width:200px;height:44px;"></td>' +
+    '<td valign="middle" align="right" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#5C7069;">Solicitud de vendedor<br><span style="font-size:15px;font-weight:bold;color:#12302B;">Bien Visto</span></td>' +
+    "</tr></table></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:32px 32px 0 32px;font-family:Arial,Helvetica,sans-serif;">' +
+    '<table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td bgcolor="#E7F0EC" style="background:#E7F0EC;border-radius:14px;padding:5px 12px;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;font-weight:bold;color:#0E6B5C;">En revisión</td></tr></table>' +
+    '<p style="margin:16px 0 0 0;font-size:30px;line-height:36px;font-weight:bold;color:#12302B;">Recibimos tu solicitud</p></td></tr>' +
+    '<tr><td bgcolor="#FFFFFF" style="padding:20px 32px 0 32px;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:24px;color:#12302B;"><p style="margin:0;">' + esc(saludo) + '</p><p style="margin:12px 0 0 0;">Está en revisión y te escribiremos <b>lo antes posible</b>.</p></td></tr>' +
+    (filas ? '<tr><td bgcolor="#FFFFFF" style="padding:28px 32px 0 32px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:22px;color:#12302B;">' + filas + "</table></td></tr>" : "") +
+    '<tr><td bgcolor="#FFFFFF" style="padding:20px 32px 32px 32px;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:21px;color:#5C7069;">Si algún dato está mal, responde a este correo.</td></tr>' +
+    '<tr><td bgcolor="#0E6B5C" style="padding:24px 32px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#FBF6EC;">' +
+    '<p style="margin:0;color:#FBF6EC;"><a href="https://bienvisto.com.mx/privacidad" style="color:#FBF6EC;text-decoration:underline;">Aviso de privacidad</a> &nbsp;|&nbsp; <a href="https://bienvisto.com.mx/terminos-clientes" style="color:#FBF6EC;text-decoration:underline;">Términos</a></p>' +
+    '<p style="margin:8px 0 0 0;color:#E7F0EC;">Bien Visto · bienvisto.com.mx</p></td></tr>' +
+    '<tr><td bgcolor="#F2A71B" style="font-size:0;line-height:4px;height:4px;">&nbsp;</td></tr>' +
+    "</table></td></tr></table></body></html>";
+  return {
+    asunto: "Recibimos tu solicitud · Bien Visto",
+    texto,
+    html,
+    adjuntos: [{ filename: "logo-bienvisto.png", content: LOGO_CORREO_B64, content_type: "image/png", content_id: LOGO_CORREO_ID }],
+  };
+}
+
 async function handleFormulario(request, env, url) {
   const tipo = url.pathname.slice("/api/formularios/".length);
   const def = Object.prototype.hasOwnProperty.call(FORMULARIOS, tipo) ? FORMULARIOS[tipo] : null;
@@ -3989,6 +4030,21 @@ async function handleFormulario(request, env, url) {
   } catch (e) {
     console.log("formulario: error al enviar " + (e && e.message));
     return jsonSitio(request, { error: "No pudimos enviarlo en este momento. Escríbenos por WhatsApp." }, 502);
+  }
+  // Acuse al candidato. Si falla, solo se registra: la solicitud ya llegó.
+  if (tipo === "vendedor" && datos.correo) {
+    try {
+      const a = solicitudRecibidaCorreo(datos);
+      const r2 = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ from: "Bien Visto <vendedores@bienvisto.com.mx>", to: [datos.correo], reply_to: CORREO_CONTACTO, subject: a.asunto, text: a.texto, html: a.html, attachments: a.adjuntos }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!r2.ok) console.log("formulario: acuse Resend " + r2.status + " " + (await r2.text().catch(() => "")).slice(0, 200));
+    } catch (e) {
+      console.log("formulario: error en acuse " + (e && e.message));
+    }
   }
   return jsonSitio(request, { ok: true });
 }
