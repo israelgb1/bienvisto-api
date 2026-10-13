@@ -1153,6 +1153,10 @@ async function crearVenta(request, env, usuario, vendedorSesion = null) {
   if (!METODOS.includes(body.metodo)) return json({ error: "metodo no válido" }, 400);
   const folios = limpiarFoliosVenta(body.folios);
   if (!folios) return json({ error: `folios debe tener entre 1 y ${MAX_VENTA} displays distintos` }, 400);
+  // El WhatsApp del cliente es obligatorio (es por donde llegan los resúmenes) y debe tener 10 dígitos.
+  if (!telefonoWa(limpiarWhatsapp(body.whatsapp))) return json({ error: "El WhatsApp del cliente debe tener 10 dígitos: lada y número" }, 400);
+  // Consentimiento para el seguimiento de 90 días: solo cuenta si viene marcado de forma explícita.
+  const consent = body.consentimiento === true ? 1 : 0;
 
   const v = await env.DB.prepare("SELECT id, nivel FROM vendedores WHERE id = ? AND estado = 'activo'").bind(vendedor).first();
   if (!v) return json({ error: "Vendedor no válido o inactivo" }, 400);
@@ -1205,8 +1209,8 @@ async function crearVenta(request, env, usuario, vendedorSesion = null) {
     }
     await env.DB.batch([
       env.DB.prepare(
-        "UPDATE ventas SET negocio = ?, direccion = ?, contacto = ?, whatsapp = ?, correo = ?, metodo = ?, cuenta_cobro_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'"
-      ).bind(negocio, limpiarTexto(body.direccion, 300), limpiarTexto(body.contacto, 120), limpiarWhatsapp(body.whatsapp), limpiarCorreo(body.correo) || null, body.metodo, cuentaPrevia, previa),
+        "UPDATE ventas SET negocio = ?, direccion = ?, contacto = ?, whatsapp = ?, correo = ?, metodo = ?, cuenta_cobro_id = ?, consent_seguimiento_at = CASE WHEN ? = 1 THEN COALESCE(consent_seguimiento_at, CURRENT_TIMESTAMP) ELSE NULL END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND estado = 'pendiente'"
+      ).bind(negocio, limpiarTexto(body.direccion, 300), limpiarTexto(body.contacto, 120), limpiarWhatsapp(body.whatsapp), limpiarCorreo(body.correo) || null, body.metodo, cuentaPrevia, consent, previa),
       env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Reutilizó venta pendiente ${previa} (${negocio}, ${folios.length} displays)`),
     ]);
     const calcPrevia = calcularVenta(folios.length, await leerConfig(env));
@@ -1253,8 +1257,8 @@ async function crearVenta(request, env, usuario, vendedorSesion = null) {
   }
   stmts.push(
     env.DB.prepare(
-      "INSERT INTO ventas (id, vendedor_id, negocio, direccion, contacto, whatsapp, correo, metodo, total, comision_total, a_entregar, cuenta_cobro_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).bind(id, vendedor, negocio, limpiarTexto(body.direccion, 300), limpiarTexto(body.contacto, 120), limpiarWhatsapp(body.whatsapp), limpiarCorreo(body.correo) || null, body.metodo, calc.total, calc.comision, calc.aEntregar, cuentaId),
+      "INSERT INTO ventas (id, vendedor_id, negocio, direccion, contacto, whatsapp, correo, metodo, total, comision_total, a_entregar, cuenta_cobro_id, consent_seguimiento_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END)"
+    ).bind(id, vendedor, negocio, limpiarTexto(body.direccion, 300), limpiarTexto(body.contacto, 120), limpiarWhatsapp(body.whatsapp), limpiarCorreo(body.correo) || null, body.metodo, calc.total, calc.comision, calc.aEntregar, cuentaId, consent),
   );
   folios.forEach((folio, i) => {
     const precio = i < calc.enPromo ? cfg.promo_precio / cfg.promo_n : cfg.precio_display;
@@ -1363,7 +1367,7 @@ async function planCobro(env, venta, urlResena, referencia, usuario, cfg) {
   // Seguimiento de 90 días: solo si hay WhatsApp y el interruptor general no está apagado (seguimiento_on = 0).
   const seg = await env.DB.prepare("SELECT valor FROM config WHERE clave = 'seguimiento_on'").first();
   if (String(venta.whatsapp || "").trim() && !(seg && Number(seg.valor) === 0)) {
-    stmts.push(env.DB.prepare("INSERT OR IGNORE INTO seguimientos (venta_id, inicio) VALUES (?, date('now', '-6 hours'))").bind(venta.id));
+    stmts.push(env.DB.prepare("INSERT OR IGNORE INTO seguimientos (venta_id, inicio, consentimiento_at) VALUES (?, date('now', '-6 hours'), ?)").bind(venta.id, venta.consent_seguimiento_at || null));
     SEGUIMIENTO_DIAS.forEach((dias, i) => {
       stmts.push(
         env.DB.prepare(
@@ -1510,6 +1514,7 @@ function telefonoWa(tel) {
   const t = String(tel || "").replace(/\D/g, "");
   if (t.length === 10) return "52" + t;
   if (t.length === 12 && t.startsWith("52")) return t;
+  if (t.length === 13 && t.startsWith("521")) return "52" + t.slice(3);
   return "";
 }
 
@@ -3204,6 +3209,7 @@ function reciboCorreo(venta, folios, vendedor) {
     n ? "Displays activos (" + n + "): " + folios.join(", ") : null,
     "",
     "Soporte y garantía: bienvisto.com.mx/soporte",
+    venta.consent_seguimiento_at ? "Seguimiento incluido: cada 15 días, durante 90 días, te mandaremos por WhatsApp un resumen del uso de tu display. Si no quieres recibirlo, responde BAJA." : null,
     "¿Necesitas factura? Pídela en bienvisto.com.mx/factura con la referencia " + venta.id + ".",
     "",
     "Este recibo no es una factura. Si pagaste una cantidad distinta, responde a este correo y lo revisamos.",
@@ -3251,7 +3257,9 @@ function reciboCorreo(venta, folios, vendedor) {
     lista +
     '<tr><td bgcolor="#FFFFFF" style="padding:32px;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:#12302B;">' +
     '<p style="margin:0;">¿Necesitas factura? Pídela en <a href="https://bienvisto.com.mx/factura" style="color:#0E6B5C;font-weight:bold;text-decoration:underline;">bienvisto.com.mx/factura</a> con la referencia ' + esc(venta.id) + ".</p>" +
-    '<p style="margin:8px 0 0 0;">Soporte y garantía: <a href="https://bienvisto.com.mx/soporte" style="color:#0E6B5C;text-decoration:underline;">bienvisto.com.mx/soporte</a></p></td></tr>' +
+    '<p style="margin:8px 0 0 0;">Soporte y garantía: <a href="https://bienvisto.com.mx/soporte" style="color:#0E6B5C;text-decoration:underline;">bienvisto.com.mx/soporte</a></p>' +
+    (venta.consent_seguimiento_at ? '<p style="margin:8px 0 0 0;">Seguimiento incluido: cada 15 días, durante 90 días, te mandaremos por WhatsApp un resumen del uso de tu display. Si no quieres recibirlo, responde BAJA.</p>' : "") +
+    "</td></tr>" +
     '<tr><td bgcolor="#0E6B5C" style="padding:24px 32px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#FBF6EC;">' +
     '<p style="margin:0;color:#FBF6EC;">Este recibo no es una factura. Si pagaste una cantidad distinta, responde a este correo y lo revisamos.</p>' +
     '<p style="margin:8px 0 0 0;color:#FBF6EC;"><a href="https://bienvisto.com.mx/privacidad" style="color:#FBF6EC;text-decoration:underline;">Aviso de privacidad</a> &nbsp;|&nbsp; <a href="https://bienvisto.com.mx/terminos-clientes" style="color:#FBF6EC;text-decoration:underline;">Términos</a></p>' +
