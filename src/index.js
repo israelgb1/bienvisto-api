@@ -1326,6 +1326,9 @@ async function marcarImpago(env, venta, body, usuario) {
   return json({ success: true, id: venta.id, impago: body.valor });
 }
 
+// Días desde la activación en que sale cada resumen; el sexto es el de cierre.
+const SEGUIMIENTO_DIAS = [15, 30, 45, 60, 75, 90];
+
 // Plan de cobro compartido por el panel y la app del vendedor: la venta pasa a cobrada, sus displays a activo
 // con la reseña (la prueba termina al cobrar) y se programa el recibo al cliente. Devuelve { error } o { stmts, n }.
 async function planCobro(env, venta, urlResena, referencia, usuario, cfg) {
@@ -1348,6 +1351,18 @@ async function planCobro(env, venta, urlResena, referencia, usuario, cfg) {
       ).bind(urlResena, venta.negocio, venta.direccion || null, f.folio),
       env.DB.prepare("INSERT INTO auditoria_estados (folio, estado_anterior, estado_nuevo, cambiado_por) VALUES (?, ?, 'activo', ?)").bind(f.folio, f.estado, usuario)
     );
+  }
+  // Seguimiento de 90 días: solo si hay WhatsApp y el interruptor general no está apagado (seguimiento_on = 0).
+  const seg = await env.DB.prepare("SELECT valor FROM config WHERE clave = 'seguimiento_on'").first();
+  if (String(venta.whatsapp || "").trim() && !(seg && Number(seg.valor) === 0)) {
+    stmts.push(env.DB.prepare("INSERT OR IGNORE INTO seguimientos (venta_id, inicio) VALUES (?, date('now', '-6 hours'))").bind(venta.id));
+    SEGUIMIENTO_DIAS.forEach((dias, i) => {
+      stmts.push(
+        env.DB.prepare(
+          "INSERT OR IGNORE INTO seguimiento_envios (venta_id, numero, programado_para) SELECT venta_id, ?, date(inicio, '+' || ? || ' days') FROM seguimientos WHERE venta_id = ?"
+        ).bind(i + 1, dias, venta.id)
+      );
+    });
   }
   stmts.push(
     env.DB.prepare("INSERT OR IGNORE INTO envios (venta_id, tipo, destinatario, programado_para) VALUES (?, 'recibo', 'cliente', datetime('now', '+' || ? || ' minutes'))").bind(venta.id, cfg.recibo_min),
@@ -1388,6 +1403,7 @@ async function recuperarDisplays(env, venta, usuario) {
       env.DB.prepare("INSERT INTO auditoria_estados (folio, estado_anterior, estado_nuevo, cambiado_por) VALUES (?, 'activo', 'retirado', ?)").bind(f.folio, usuario)
     );
   }
+  stmts.push(...stmtsCancelarSeguimiento(env, venta.id));
   stmts.push(env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Marcó por recuperar ${activos.length} displays de la venta ${venta.id}`));
   await env.DB.batch(stmts);
   return json({ success: true, id: venta.id, retirados: activos.length });
@@ -1400,6 +1416,14 @@ async function anularVenta(env, venta, usuario) {
   if (plan.error) return plan.error;
   await env.DB.batch(plan.stmts);
   return json({ success: true, id: venta.id, estado: "anulada" });
+}
+
+// Si la venta se anula o sus displays se recuperan, el seguimiento se detiene y los envíos pendientes se omiten.
+function stmtsCancelarSeguimiento(env, ventaId) {
+  return [
+    env.DB.prepare("UPDATE seguimientos SET estado = 'cancelado' WHERE venta_id = ? AND estado = 'activo'").bind(ventaId),
+    env.DB.prepare("UPDATE seguimiento_envios SET estado = 'omitido' WHERE venta_id = ? AND estado = 'pendiente'").bind(ventaId),
+  ];
 }
 
 // Plan de anulación: devuelve { error } o { stmts } para ejecutar en un solo batch.
@@ -1430,6 +1454,7 @@ async function planAnular(env, venta, usuario) {
       );
     }
   }
+  stmts.push(...stmtsCancelarSeguimiento(env, venta.id));
   stmts.push(env.DB.prepare("DELETE FROM venta_folios WHERE venta_id = ?").bind(venta.id));
   stmts.push(env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Anuló venta ${venta.id} (estado previo: ${venta.estado})`));
   return { stmts };
