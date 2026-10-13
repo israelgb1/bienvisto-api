@@ -2934,19 +2934,66 @@ function reciboCorreo(venta, folios, vendedor) {
 
 function comprobanteCorreo(venta, folios, vendedor) {
   const comision = Number(venta.total) - Number(venta.a_entregar);
+  const n = folios.length;
+  const primer = String((vendedor && vendedor.nombre) || "").trim().split(/\s+/)[0] || "";
+  const fecha = fechaLarga(venta.entregada_at || venta.updated_at);
+  const saludo = (primer ? "Hola " + primer + ", Bien" : "Bien") + " Visto confirmó tu entrega.";
+  const displays = n + (n === 1 ? " display" : " displays");
+
   const lineas = [
-    "Bien Visto confirmó tu entrega.",
+    saludo,
     "",
-    "Venta " + venta.id + " · " + venta.negocio + " · " + folios.length + (folios.length === 1 ? " display" : " displays"),
-    "• Cobrado por ti: " + fmtMXN(venta.total),
-    "• Tu comisión retenida: " + fmtMXN(comision),
-    "• Entregado: " + fmtMXN(venta.entregado),
+    "Venta " + venta.id + " · " + venta.negocio + " · " + displays,
+    "Cobrado por ti: " + fmtMXN(venta.total),
+    "Tu comisión retenida: " + fmtMXN(comision),
+    "Entregado: " + fmtMXN(venta.entregado),
+    fecha ? "Fecha de confirmación: " + fecha : null,
     "",
     "Es un comprobante interno de entrega. No es una factura.",
-  ];
+  ].filter((x) => x !== null);
   const texto = lineas.join("\n");
-  const html = lineas.map((l) => (l === "" ? "<br>" : "<p>" + esc(l) + "</p>")).join("");
-  return { asunto: "Comprobante de entrega · " + venta.id, texto, html };
+
+  const fila = (k, v, ultima) =>
+    '<tr><td width="170" valign="top" style="padding:12px 0;border-top:1px solid #DDE7E2;' + (ultima ? "border-bottom:1px solid #DDE7E2;" : "") + 'color:#5C7069;">' + esc(k) + '</td>' +
+    '<td valign="top" style="padding:12px 0;border-top:1px solid #DDE7E2;' + (ultima ? "border-bottom:1px solid #DDE7E2;" : "") + '">' + v + '</td></tr>';
+  const filas = [
+    fila("Negocio", esc(venta.negocio), false),
+    fila("Displays", esc(displays), false),
+    fila("Cobrado por ti", esc(fmtMXN(venta.total)), false),
+    fila("Tu comisión retenida", esc(fmtMXN(comision)), !fecha),
+    fecha ? fila("Fecha de confirmación", esc(fecha), true) : "",
+  ].join("");
+
+  const html =
+    '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Comprobante de entrega</title></head>' +
+    '<body style="margin:0;padding:0;background:#F3F1EC;">' +
+    '<div style="display:none;max-height:0;overflow:hidden;color:#F3F1EC;mso-hide:all;">Bien Visto confirmó tu entrega de ' + esc(fmtMXN(venta.entregado)) + " de la venta " + esc(venta.id) + ".</div>" +
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#F3F1EC" style="background:#F3F1EC;"><tr><td align="center" style="padding:24px 12px;">' +
+    '<table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" bgcolor="#FFFFFF" style="width:600px;max-width:600px;background:#FFFFFF;">' +
+    '<tr><td bgcolor="#FFFFFF" style="padding:28px 32px 24px 32px;border-bottom:1px solid #DDE7E2;font-family:Arial,Helvetica,sans-serif;">' +
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr>' +
+    '<td valign="middle" align="left"><img src="cid:' + LOGO_CORREO_ID + '" width="200" height="44" alt="Bien Visto" style="display:block;border:0;outline:none;text-decoration:none;width:200px;height:44px;"></td>' +
+    '<td valign="middle" align="right" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#5C7069;">Comprobante de entrega<br><span style="font-size:15px;font-weight:bold;color:#12302B;">' + esc(venta.id) + "</span></td>" +
+    "</tr></table></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:32px 32px 0 32px;font-family:Arial,Helvetica,sans-serif;">' +
+    '<table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td bgcolor="#E7F0EC" style="background:#E7F0EC;border-radius:14px;padding:5px 12px;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;font-weight:bold;color:#0E6B5C;">Entrega confirmada</td></tr></table>' +
+    '<p style="margin:16px 0 0 0;font-size:13px;line-height:18px;color:#5C7069;">Entregado</p>' +
+    '<p style="margin:6px 0 0 0;font-size:40px;line-height:44px;font-weight:bold;color:#12302B;">' + esc(fmtMXN(venta.entregado)) + "</p></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:24px 32px 0 32px;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:24px;color:#12302B;"><p style="margin:0;">' + esc(saludo) + "</p></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:28px 32px 32px 32px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:22px;color:#12302B;">' +
+    filas + "</table></td></tr>" +
+    '<tr><td bgcolor="#0E6B5C" style="padding:24px 32px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#FBF6EC;">' +
+    '<p style="margin:0;color:#FBF6EC;">Es un comprobante interno de entrega. No es una factura.</p>' +
+    '<p style="margin:8px 0 0 0;color:#FBF6EC;"><a href="https://bienvisto.com.mx/privacidad" style="color:#FBF6EC;text-decoration:underline;">Aviso de privacidad</a> &nbsp;|&nbsp; <a href="https://bienvisto.com.mx/terminos-clientes" style="color:#FBF6EC;text-decoration:underline;">Términos</a></p>' +
+    '<p style="margin:8px 0 0 0;color:#E7F0EC;">Bien Visto · bienvisto.com.mx</p></td></tr>' +
+    '<tr><td bgcolor="#F2A71B" style="font-size:0;line-height:4px;height:4px;">&nbsp;</td></tr>' +
+    "</table></td></tr></table></body></html>";
+  return {
+    asunto: "Comprobante de entrega · " + venta.id,
+    texto,
+    html,
+    adjuntos: [{ filename: "logo-bienvisto.png", content: LOGO_CORREO_B64, content_type: "image/png", content_id: LOGO_CORREO_ID }],
+  };
 }
 
 async function enviarEnvio(env, e) {
