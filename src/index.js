@@ -2932,6 +2932,78 @@ function reciboCorreo(venta, folios, vendedor) {
   };
 }
 
+// Confirmación al vendedor de que Bien Visto recibió su aviso de entrega. Sigue siendo "en revisión"
+// hasta que Bien Visto lo confirme (entonces llega el comprobante de entrega) o lo rechace.
+function avisoCorreo(aviso, vendedor, tieneComprobante) {
+  const primer = String((vendedor && vendedor.nombre) || "").trim().split(/\s+/)[0] || "";
+  const transferencia = aviso.metodo === "transferencia";
+  const fecha = fechaLarga(aviso.created_at);
+  const saludo = (primer ? "Hola " + primer + ", recibimos" : "Recibimos") + " tu aviso de entrega.";
+  const explica = "Bien Visto lo está revisando. Hasta que lo confirme, tu saldo por entregar no cambia. Cuando lo confirme, te llegará el comprobante de entrega por correo.";
+
+  const lineas = [
+    saludo,
+    explica,
+    "",
+    "Aviso " + aviso.id,
+    "Monto avisado: " + fmtMXN(aviso.monto),
+    "Estado: en revisión por Bien Visto",
+    fecha ? "Fecha del aviso: " + fecha : null,
+    "Forma de entrega: " + (transferencia ? "Transferencia" + (aviso.referencia ? " (clave de rastreo " + aviso.referencia + ")" : "") : "Efectivo"),
+    "Comprobante adjunto: " + (tieneComprobante ? "sí" : "no"),
+    "",
+    "Si algún dato no coincide, responde a este correo.",
+    "Este aviso no es un comprobante de entrega ni una factura.",
+  ].filter((x) => x !== null);
+  const texto = lineas.join("\n");
+
+  const fila = (k, v, ultima) =>
+    '<tr><td width="170" valign="top" style="padding:12px 0;border-top:1px solid #DDE7E2;' + (ultima ? "border-bottom:1px solid #DDE7E2;" : "") + 'color:#5C7069;">' + esc(k) + '</td>' +
+    '<td valign="top" style="padding:12px 0;border-top:1px solid #DDE7E2;' + (ultima ? "border-bottom:1px solid #DDE7E2;" : "") + '">' + v + '</td></tr>';
+  const filas = [
+    fecha ? fila("Fecha del aviso", esc(fecha), false) : "",
+    fila("Forma de entrega", transferencia
+      ? "Transferencia" + (aviso.referencia ? '<br><span style="font-size:13px;color:#5C7069;">Clave de rastreo ' + esc(aviso.referencia) + "</span>" : "")
+      : "Efectivo", false),
+    fila("Comprobante adjunto", tieneComprobante ? "Sí" : "No", true),
+  ].join("");
+
+  const html =
+    '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aviso de entrega recibido</title></head>' +
+    '<body style="margin:0;padding:0;background:#F3F1EC;">' +
+    '<div style="display:none;max-height:0;overflow:hidden;color:#F3F1EC;mso-hide:all;">Recibimos tu aviso ' + esc(aviso.id) + " por " + esc(fmtMXN(aviso.monto)) + ". Está en revisión.</div>" +
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#F3F1EC" style="background:#F3F1EC;"><tr><td align="center" style="padding:24px 12px;">' +
+    '<table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" bgcolor="#FFFFFF" style="width:600px;max-width:600px;background:#FFFFFF;">' +
+    '<tr><td bgcolor="#FFFFFF" style="padding:28px 32px 24px 32px;border-bottom:1px solid #DDE7E2;font-family:Arial,Helvetica,sans-serif;">' +
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr>' +
+    '<td valign="middle" align="left"><img src="cid:' + LOGO_CORREO_ID + '" width="200" height="44" alt="Bien Visto" style="display:block;border:0;outline:none;text-decoration:none;width:200px;height:44px;"></td>' +
+    '<td valign="middle" align="right" style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#5C7069;">Aviso de entrega<br><span style="font-size:15px;font-weight:bold;color:#12302B;">' + esc(aviso.id) + "</span></td>" +
+    "</tr></table></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:32px 32px 0 32px;font-family:Arial,Helvetica,sans-serif;">' +
+    '<table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td bgcolor="#FDF1D6" style="background:#FDF1D6;border-radius:14px;padding:5px 12px;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;font-weight:bold;color:#7A5200;">En revisión por Bien Visto</td></tr></table>' +
+    '<p style="margin:16px 0 0 0;font-size:13px;line-height:18px;color:#5C7069;">Monto avisado</p>' +
+    '<p style="margin:6px 0 0 0;font-size:40px;line-height:44px;font-weight:bold;color:#12302B;">' + esc(fmtMXN(aviso.monto)) + "</p></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:24px 32px 0 32px;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:24px;color:#12302B;">' +
+    '<p style="margin:0;">' + esc(saludo) + "</p>" +
+    '<p style="margin:12px 0 0 0;">' + esc(explica) + "</p></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:28px 32px 0 32px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:22px;color:#12302B;">' +
+    filas + "</table></td></tr>" +
+    '<tr><td bgcolor="#FFFFFF" style="padding:32px;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:#12302B;">' +
+    '<p style="margin:0;">Si algún dato no coincide, responde a este correo y lo revisamos.</p></td></tr>' +
+    '<tr><td bgcolor="#0E6B5C" style="padding:24px 32px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#FBF6EC;">' +
+    '<p style="margin:0;color:#FBF6EC;">Este aviso no es un comprobante de entrega ni una factura.</p>' +
+    '<p style="margin:8px 0 0 0;color:#FBF6EC;"><a href="https://bienvisto.com.mx/privacidad" style="color:#FBF6EC;text-decoration:underline;">Aviso de privacidad</a> &nbsp;|&nbsp; <a href="https://bienvisto.com.mx/terminos-clientes" style="color:#FBF6EC;text-decoration:underline;">Términos</a></p>' +
+    '<p style="margin:8px 0 0 0;color:#E7F0EC;">Bien Visto · bienvisto.com.mx</p></td></tr>' +
+    '<tr><td bgcolor="#F2A71B" style="font-size:0;line-height:4px;height:4px;">&nbsp;</td></tr>' +
+    "</table></td></tr></table></body></html>";
+  return {
+    asunto: "Recibimos tu aviso de entrega · " + aviso.id,
+    texto,
+    html,
+    adjuntos: [{ filename: "logo-bienvisto.png", content: LOGO_CORREO_B64, content_type: "image/png", content_id: LOGO_CORREO_ID }],
+  };
+}
+
 function comprobanteCorreo(venta, folios, vendedor) {
   const comision = Number(venta.total) - Number(venta.a_entregar);
   const lineas = [
@@ -2949,7 +3021,31 @@ function comprobanteCorreo(venta, folios, vendedor) {
   return { asunto: "Comprobante de entrega · " + venta.id, texto, html };
 }
 
+async function enviarResend(env, destino, msg) {
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ from: "Bien Visto <vendedores@bienvisto.com.mx>", to: [destino], subject: msg.asunto, text: msg.texto, html: msg.html, ...(msg.adjuntos ? { attachments: msg.adjuntos } : {}) }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (res.ok) return { estado: "enviado" };
+  const detalle = await res.text().catch(() => "");
+  return { estado: "error", error: "Resend " + res.status + ": " + detalle.slice(0, 200) };
+}
+
+// Aviso de entrega recibido (al vendedor). Solo tiene sentido mientras Bien Visto aún lo está revisando:
+// si ya se confirmó o rechazó, el vendedor recibe el comprobante o el motivo y este correo se omite.
+async function enviarAviso(env, e) {
+  const aviso = await env.DB.prepare("SELECT id, vendedor_id, monto, metodo, referencia, estado, comprobante_key, created_at FROM avisos_entrega WHERE id = ?").bind(e.venta_id).first();
+  if (!aviso) return { estado: "error", error: "aviso no encontrado" };
+  if (aviso.estado !== "pendiente" && aviso.estado !== "confirmando") return { estado: "omitido", error: "aviso " + aviso.estado };
+  const vendedor = await env.DB.prepare("SELECT nombre, correo FROM vendedores WHERE id = ?").bind(aviso.vendedor_id).first();
+  if (!vendedor || !vendedor.correo) return { estado: "sin_correo", error: "sin correo de destino" };
+  return enviarResend(env, vendedor.correo, avisoCorreo(aviso, vendedor, !!aviso.comprobante_key));
+}
+
 async function enviarEnvio(env, e) {
+  if (e.tipo === "aviso") return enviarAviso(env, e);
   const venta = await env.DB.prepare("SELECT * FROM ventas WHERE id = ?").bind(e.venta_id).first();
   if (!venta) return { estado: "error", error: "venta no encontrada" };
   // Si la venta se anuló o rechazó después de programar el correo, ya no se envía (sus folios ya no existen).
@@ -2960,15 +3056,7 @@ async function enviarEnvio(env, e) {
   const { results: fs } = await env.DB.prepare("SELECT folio FROM venta_folios WHERE venta_id = ? ORDER BY folio").bind(venta.id).all();
   const folios = fs.map((x) => x.folio);
   const msg = e.tipo === "recibo" ? reciboCorreo(venta, folios, vendedor) : comprobanteCorreo(venta, folios, vendedor);
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from: "Bien Visto <vendedores@bienvisto.com.mx>", to: [destino], subject: msg.asunto, text: msg.texto, html: msg.html, ...(msg.adjuntos ? { attachments: msg.adjuntos } : {}) }),
-    signal: AbortSignal.timeout(10000),
-  });
-  if (res.ok) return { estado: "enviado" };
-  const detalle = await res.text().catch(() => "");
-  return { estado: "error", error: "Resend " + res.status + ": " + detalle.slice(0, 200) };
+  return enviarResend(env, destino, msg);
 }
 
 async function enviarPendientes(env) {
@@ -3496,6 +3584,8 @@ async function crearAvisoEntrega(request, env, vendedor) {
   const id = "AE-" + crypto.randomUUID().replace(/-/g, "").slice(0, 8);
   await env.DB.batch([
     env.DB.prepare("INSERT INTO avisos_entrega (id, vendedor_id, monto, metodo, referencia, estado) VALUES (?, ?, ?, ?, ?, 'pendiente')").bind(id, vendedor.id, monto, body.metodo, referencia),
+    // Confirmación por correo al vendedor: sale con el cron (reintenta si Resend falla). venta_id guarda el id del aviso.
+    env.DB.prepare("INSERT OR IGNORE INTO envios (venta_id, tipo, destinatario, programado_para) VALUES (?, 'aviso', 'vendedor', CURRENT_TIMESTAMP)").bind(id),
     env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind("vendedor:" + vendedor.id, "Aviso de entrega " + id + " por " + monto + " (" + body.metodo + ")"),
   ]);
   return json({ success: true, id, monto, metodo: body.metodo }, 201);
