@@ -147,6 +147,14 @@ async function handleApi(request, env, url) {
       return vistaVendedor(request, env, url, usuario);
     }
 
+    if (path === "/api/seguimiento/hoy" && method === "GET") {
+      return resumenesDeHoy(env);
+    }
+    const segAccion = path.match(/^\/api\/seguimiento\/([A-Za-z0-9-]{1,40})\/(consentimiento|saludo|respondio|baja|envio\/([1-6])\/(enviado|omitir))$/);
+    if (segAccion && method === "POST") {
+      const [, ventaId, a, num, accionEnvio] = segAccion;
+      return accionSeguimiento(env, ventaId, num ? accionEnvio : a, num ? Number(num) : null, usuario);
+    }
     if (path === "/api/escaneos/serie" && method === "GET") {
       return serieEscaneos(env);
     }
@@ -1418,6 +1426,198 @@ async function anularVenta(env, venta, usuario) {
   return json({ success: true, id: venta.id, estado: "anulada" });
 }
 
+// ==========================================
+// Seguimiento de 90 días: resúmenes quincenales por WhatsApp (envío manual desde el panel)
+// ==========================================
+const SEG_UMBRAL_BAJO = 10;   // menos de esto por display en la quincena = actividad baja
+const SEG_UMBRAL_ALTO = 50;   // esto o más por display = actividad alta
+const DIAS_SEMANA = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
+
+function sumarDias(dia, n) {
+  const d = new Date(dia + "T12:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+function hora12(h) {
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}${h < 12 ? " am" : " pm"}`;
+}
+
+// Cifras de una venta (sumando todos sus displays) entre dos días en hora de México. Solo escaneos contados
+// y posteriores al último cambio de negocio de cada display.
+async function cifrasVenta(env, ventaId, desde, hasta) {
+  const { results } = await env.DB.prepare(
+    `SELECT e.dia_mx AS dia, CAST(strftime('%H', e.created_at, '-6 hours') AS INTEGER) AS h, e.origen, e.dispositivo
+     FROM escaneos e JOIN venta_folios vf ON vf.folio = e.folio JOIN folios f ON f.folio = e.folio
+     WHERE vf.venta_id = ? AND e.contado = 1 AND e.dia_mx BETWEEN ? AND ? AND e.created_at >= COALESCE(f.conteo_desde, '')
+     LIMIT 20000`
+  ).bind(ventaId, desde, hasta).all();
+  return results;
+}
+
+function resumirCifras(filas, desde, dias) {
+  const porDia = [];
+  for (let i = 0; i < dias; i++) porDia.push({ dia: sumarDias(desde, i), n: 0 });
+  const idx = Object.fromEntries(porDia.map((x, i) => [x.dia, i]));
+  const horas = new Array(24).fill(0);
+  const sem = new Array(7).fill(0);
+  let qr = 0, nfc = 0, ios = 0, android = 0;
+  for (const f of filas) {
+    if (f.dia in idx) porDia[idx[f.dia]].n++;
+    horas[f.h]++;
+    sem[new Date(f.dia + "T12:00:00Z").getUTCDay()]++;
+    if (f.origen === "qr") qr++; else nfc++;
+    if (f.dispositivo === "ios") ios++; else if (f.dispositivo === "android") android++;
+  }
+  const total = filas.length;
+  const mejorDiaSem = total ? sem.indexOf(Math.max(...sem)) : null;
+  // Franja de 2 horas con más escaneos.
+  let mejorH = null, mejorN = 0;
+  for (let h = 0; h < 24; h += 2) {
+    const n = horas[h] + horas[h + 1];
+    if (n > mejorN) { mejorN = n; mejorH = h; }
+  }
+  const finde = sem[0] + sem[6];
+  return {
+    total, por_dia: porDia,
+    mejor_dia: mejorDiaSem === null ? null : { nombre: DIAS_SEMANA[mejorDiaSem], n: sem[mejorDiaSem] },
+    mejor_franja: mejorH === null ? null : { desde: hora12(mejorH), hasta: hora12((mejorH + 2) % 24), n: mejorN, pct: Math.round((mejorN / total) * 100) },
+    pct_finde: total ? Math.round((finde / total) * 100) : 0,
+    qr, nfc, ios, android,
+  };
+}
+
+function hashNum(texto) {
+  let h = 0;
+  for (let i = 0; i < texto.length; i++) h = (h * 31 + texto.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+// Elige la recomendación: del nivel, sin repetir las ya enviadas a esa venta, prefiriendo las del momento del seguimiento.
+function elegirRecomendacion(recs, nivel, numero, ventaId, usadas) {
+  const fase = numero <= 2 ? "inicio" : numero <= 4 ? "medio" : "cierre";
+  const delNivel = recs.filter((r) => r.nivel === nivel && r.activa === 1);
+  const libres = delNivel.filter((r) => !usadas.has(r.id));
+  const orden = (lista) => [...lista].sort((a, b) => hashNum(ventaId + numero + a.id) - hashNum(ventaId + numero + b.id));
+  for (const lista of [libres.filter((r) => r.momento === fase), libres.filter((r) => r.momento === "todos"), libres, delNivel]) {
+    if (lista.length) return orden(lista)[0];
+  }
+  return null;
+}
+
+function telefonoWa(tel) {
+  const t = String(tel || "").replace(/\D/g, "");
+  if (t.length === 10) return "52" + t;
+  if (t.length === 12 && t.startsWith("52")) return t;
+  return "";
+}
+
+async function umbralesSeguimiento(env) {
+  const { results } = await env.DB.prepare("SELECT clave, valor FROM config WHERE clave IN ('seg_umbral_bajo', 'seg_umbral_alto', 'seguimiento_on')").all();
+  const c = Object.fromEntries(results.map((r) => [r.clave, Number(r.valor)]));
+  return { bajo: c.seg_umbral_bajo || SEG_UMBRAL_BAJO, alto: c.seg_umbral_alto || SEG_UMBRAL_ALTO, activo: c.seguimiento_on !== 0 };
+}
+
+// Todo lo que lleva un resumen: periodo, cifras, nivel, recomendación y datos de contacto.
+async function armarResumen(env, s, e, recs, um) {
+  const { results: fol } = await env.DB.prepare("SELECT vf.folio FROM venta_folios vf WHERE vf.venta_id = ? ORDER BY vf.folio").bind(s.venta_id).all();
+  const folios = fol.map((f) => f.folio);
+  const fin = sumarDias(e.programado_para, -1);
+  const ini = sumarDias(e.programado_para, -15);
+  const actual = resumirCifras(await cifrasVenta(env, s.venta_id, ini, fin), ini, 15);
+  let anterior = null;
+  if (e.numero > 1) anterior = (await cifrasVenta(env, s.venta_id, sumarDias(ini, -15), sumarDias(ini, -1))).length;
+  const acum = (await cifrasVenta(env, s.venta_id, s.inicio, fin)).length;
+  const nDisplays = Math.max(1, folios.length);
+  const porDisplay = actual.total / nDisplays;
+  const nivel = porDisplay < um.bajo ? "bajo" : porDisplay >= um.alto ? "alto" : "medio";
+  const { results: prev } = await env.DB.prepare("SELECT datos FROM seguimiento_envios WHERE venta_id = ? AND estado = 'enviado'").bind(s.venta_id).all();
+  const usadas = new Set(prev.map((p) => { try { return JSON.parse(p.datos).rec_id; } catch { return null; } }).filter(Boolean));
+  const rec = e.numero === 6 ? null : elegirRecomendacion(recs, nivel, e.numero, s.venta_id, usadas);
+  return {
+    venta_id: s.venta_id, numero: e.numero, programado_para: e.programado_para,
+    negocio: s.negocio, contacto: s.contacto, whatsapp: telefonoWa(s.whatsapp), folios,
+    periodo: { desde: ini, hasta: fin }, cifras: actual, anterior, acumulado: acum, nivel,
+    rec: rec ? { id: rec.id, texto: rec.texto } : null,
+  };
+}
+
+const SEG_SELECT = "s.venta_id, s.inicio, s.consentimiento_at, s.saludo_at, s.respondio_at, v.negocio, v.contacto, v.whatsapp";
+
+async function resumenesDeHoy(env) {
+  const um = await umbralesSeguimiento(env);
+  const hoy = new Date(Date.now() - 6 * 3600 * 1000).toISOString().slice(0, 10);
+  const { results: recs } = await env.DB.prepare("SELECT id, nivel, momento, texto, activa FROM seguimiento_recs").all();
+  const { results: sinConsent } = await env.DB.prepare(
+    `SELECT ${SEG_SELECT} FROM seguimientos s JOIN ventas v ON v.id = s.venta_id WHERE s.estado = 'activo' AND s.consentimiento_at IS NULL ORDER BY s.inicio LIMIT 100`
+  ).all();
+  const { results: saludos } = await env.DB.prepare(
+    `SELECT ${SEG_SELECT} FROM seguimientos s JOIN ventas v ON v.id = s.venta_id WHERE s.estado = 'activo' AND s.consentimiento_at IS NOT NULL AND s.saludo_at IS NULL ORDER BY s.inicio LIMIT 100`
+  ).all();
+  const { results: debidos } = await env.DB.prepare(
+    `SELECT ${SEG_SELECT}, e.numero, e.programado_para FROM seguimiento_envios e JOIN seguimientos s ON s.venta_id = e.venta_id JOIN ventas v ON v.id = e.venta_id
+     WHERE e.estado = 'pendiente' AND e.programado_para <= ? AND s.estado = 'activo' AND s.consentimiento_at IS NOT NULL AND s.saludo_at IS NOT NULL
+     ORDER BY e.programado_para, e.numero LIMIT 100`
+  ).bind(hoy).all();
+  const envios = [];
+  for (const d of debidos) envios.push({ ...(await armarResumen(env, d, d, recs, um)), respondio: !!d.respondio_at });
+  // Promedio de la red: solo se muestra cuando hay al menos 20 displays activos.
+  let promedio = null;
+  const act = await env.DB.prepare("SELECT COUNT(*) AS n FROM folios WHERE estado = 'activo'").first();
+  if (Number(act.n) >= 20) {
+    const t = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM escaneos e JOIN folios f ON f.folio = e.folio WHERE e.contado = 1 AND f.estado = 'activo' AND e.dia_mx BETWEEN ? AND ? AND e.created_at >= COALESCE(f.conteo_desde, '')"
+    ).bind(sumarDias(hoy, -15), sumarDias(hoy, -1)).first();
+    promedio = Math.round(Number(t.n) / Number(act.n));
+  }
+  const mapa = (s) => ({ venta_id: s.venta_id, negocio: s.negocio, contacto: s.contacto, whatsapp: telefonoWa(s.whatsapp), inicio: s.inicio });
+  return json({ activo: um.activo, hoy, umbrales: { bajo: um.bajo, alto: um.alto }, promedio_red: promedio, envios, saludos: saludos.map(mapa), sin_consentimiento: sinConsent.map(mapa) });
+}
+
+async function accionSeguimiento(env, ventaId, accion, numero, usuario) {
+  const s = await env.DB.prepare(
+    `SELECT ${SEG_SELECT} FROM seguimientos s JOIN ventas v ON v.id = s.venta_id WHERE s.venta_id = ?`
+  ).bind(ventaId).first();
+  if (!s) return json({ error: "Esa venta no tiene seguimiento" }, 404);
+  const aud = (txt) => env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `${txt} (venta ${ventaId})`);
+  if (accion === "consentimiento") {
+    await env.DB.batch([env.DB.prepare("UPDATE seguimientos SET consentimiento_at = COALESCE(consentimiento_at, CURRENT_TIMESTAMP) WHERE venta_id = ?").bind(ventaId), aud("Registró el consentimiento del seguimiento")]);
+  } else if (accion === "saludo") {
+    await env.DB.batch([env.DB.prepare("UPDATE seguimientos SET saludo_at = COALESCE(saludo_at, CURRENT_TIMESTAMP) WHERE venta_id = ?").bind(ventaId), aud("Marcó enviado el saludo del seguimiento")]);
+  } else if (accion === "respondio") {
+    await env.DB.batch([env.DB.prepare("UPDATE seguimientos SET respondio_at = COALESCE(respondio_at, CURRENT_TIMESTAMP) WHERE venta_id = ?").bind(ventaId), aud("Marcó que el cliente respondió al saludo")]);
+  } else if (accion === "baja") {
+    await env.DB.batch([
+      env.DB.prepare("UPDATE seguimientos SET estado = 'baja', baja_at = CURRENT_TIMESTAMP WHERE venta_id = ? AND estado = 'activo'").bind(ventaId),
+      env.DB.prepare("UPDATE seguimiento_envios SET estado = 'omitido' WHERE venta_id = ? AND estado = 'pendiente'").bind(ventaId),
+      aud("Dio de baja el seguimiento"),
+    ]);
+  } else if (accion === "enviado" || accion === "omitir") {
+    const e = await env.DB.prepare("SELECT numero, programado_para, estado FROM seguimiento_envios WHERE venta_id = ? AND numero = ?").bind(ventaId, numero).first();
+    if (!e) return json({ error: "Ese envío no existe" }, 404);
+    if (e.estado !== "pendiente") return json({ error: "Ese envío ya no está pendiente" }, 409);
+    if (accion === "omitir") {
+      await env.DB.batch([env.DB.prepare("UPDATE seguimiento_envios SET estado = 'omitido' WHERE venta_id = ? AND numero = ? AND estado = 'pendiente'").bind(ventaId, numero), aud(`Omitió el resumen ${numero}`)]);
+    } else {
+      // Se guardan las cifras y la recomendación del momento para no repetirlas y poder revisar qué se mandó.
+      const um = await umbralesSeguimiento(env);
+      const { results: recs } = await env.DB.prepare("SELECT id, nivel, momento, texto, activa FROM seguimiento_recs").all();
+      const r = await armarResumen(env, s, e, recs, um);
+      const datos = JSON.stringify({ rec_id: r.rec ? r.rec.id : null, total: r.cifras.total, anterior: r.anterior, acumulado: r.acumulado, periodo: r.periodo });
+      const stmts = [
+        env.DB.prepare("UPDATE seguimiento_envios SET estado = 'enviado', enviado_at = CURRENT_TIMESTAMP, nivel = ?, datos = ? WHERE venta_id = ? AND numero = ? AND estado = 'pendiente'").bind(r.nivel, datos, ventaId, numero),
+        aud(`Marcó enviado el resumen ${numero}`),
+      ];
+      if (numero === 6) stmts.push(env.DB.prepare("UPDATE seguimientos SET estado = 'terminado' WHERE venta_id = ? AND estado = 'activo'").bind(ventaId));
+      await env.DB.batch(stmts);
+    }
+  } else {
+    return json({ error: "Acción no válida" }, 400);
+  }
+  return json({ success: true });
+}
+
 // Si la venta se anula o sus displays se recuperan, el seguimiento se detiene y los envíos pendientes se omiten.
 function stmtsCancelarSeguimiento(env, ventaId) {
   return [
@@ -2016,6 +2216,7 @@ async function permisosRequeridos(request, env, url, method, path) {
   const sin = (todos, alguno = []) => ({ todos, alguno });
   if (method === "GET") {
     if (path === "/api/escaneos/serie" || path === "/api/pruebas/resumen") return sin(["ver_resumen"]);
+    if (path === "/api/seguimiento/hoy") return sin(["ver_cobros"]);
     if (path === "/api/displays" || path === "/api/lotes") return sin(["ver_inventario"]);
     if (path === "/api/vendedores" || path === "/api/solicitudes" || path === "/api/cuentas-cobro" || path === "/api/altas-vendedor") return sin(["ver_vendedores"]);
     if (path === "/api/ventas" || path === "/api/cortes" || path === "/api/avisos-entrega" || path === "/api/precios" || /^\/api\/ventas\/[^/]+\/comprobante$/.test(path) || /^\/api\/avisos-entrega\/[^/]+\/comprobante$/.test(path)) return sin(["ver_cobros"]);
@@ -2062,6 +2263,7 @@ async function permisosRequeridos(request, env, url, method, path) {
   if (path === "/api/ventas" && method === "POST") return sin(["cobros_confirmar"]);
   if (/^\/api\/ventas\/[^/]+\/comprobante$/.test(path) && method === "POST") return sin(["cobros_confirmar"]);
   if (path.startsWith("/api/avisos-entrega")) return sin(["cobros_confirmar"]);
+  if (path.startsWith("/api/seguimiento/")) return sin(["cobros_confirmar"]);
   return sin(["accesos"]);
 }
 
