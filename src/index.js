@@ -2078,18 +2078,16 @@ async function actualizarFolio(request, env, url, usuario) {
   }
   const esMenu = esTipoMenu(actual.lote_tipo);
   const esWifi = esTipoWifi(actual.lote_tipo);
+  const conRed = esTipoConRed(actual.lote_tipo);
 
-  // Wi-Fi: no lleva enlace y los datos de la red se validan aparte.
+  // Datos de red: solo en Wi-Fi y en menú con QR de Wi-Fi. El Wi-Fi puro no lleva enlace.
   let red = null;
-  if (esWifi) {
-    if (body.url_destino !== undefined && body.url_destino !== null) return json({ error: "Los displays de Wi-Fi no llevan enlace" }, 400);
-    if (body.wifi !== undefined) {
-      const v = validarWifi(body.wifi);
-      if (typeof v === "string") return json({ error: v }, 400);
-      red = v;
-    }
-  } else if (body.wifi !== undefined) {
-    return json({ error: "Solo los displays de tipo Wi-Fi tienen datos de red" }, 400);
+  if (esWifi && body.url_destino !== undefined && body.url_destino !== null) return json({ error: "Los displays de Wi-Fi no llevan enlace" }, 400);
+  if (body.wifi !== undefined) {
+    if (!conRed) return json({ error: "Este tipo de display no tiene datos de red" }, 400);
+    const v = validarWifi(body.wifi);
+    if (typeof v === "string") return json({ error: v }, 400);
+    red = v;
   }
 
   if (body.url_destino !== undefined && body.url_destino !== null && !esUrlDestino(body.url_destino, actual.lote_tipo)) {
@@ -2145,7 +2143,7 @@ async function actualizarFolio(request, env, url, usuario) {
   const stmts = [
     env.DB.prepare(`UPDATE folios SET ${sets.join(", ")} WHERE folio = ?`).bind(...params, folio),
   ];
-  if (esWifi) {
+  if (conRed) {
     if (red) {
       stmts.push(
         env.DB.prepare(
@@ -2787,13 +2785,18 @@ function randomDe(conjunto) {
 // "Menú digital (redirección)" manda al enlace que da el restaurante (Drive, PDF, su propio menú, etc.).
 const TIPO_RESENAS = "Reseñas de Google";
 const TIPO_MENU = "Menú digital (redirección)";
-const esTipoMenu = (tipo) => tipo === TIPO_MENU;
+// Variante del menú con un segundo QR impreso que conecta al Wi-Fi. Se comporta como menú; además guarda la red
+// del negocio para generar ese QR (el QR de Wi-Fi se une a la red directo, sin pasar por Bien Visto).
+const TIPO_MENU_WIFI = "Menú digital + Wi-Fi (redirección)";
+const esTipoMenu = (tipo) => tipo === TIPO_MENU || tipo === TIPO_MENU_WIFI;
 // "Wi-Fi": al escanearlo se muestra la red y la contraseña del negocio (no redirige a otro sitio).
 const TIPO_WIFI = "Wi-Fi";
 const esTipoWifi = (tipo) => tipo === TIPO_WIFI;
 // Menú y Wi-Fi se gestionan solo desde el panel: no se asignan a vendedores ni tienen periodo de prueba.
 const esTipoSoloPanel = (tipo) => esTipoMenu(tipo) || esTipoWifi(tipo);
-const categoriaTipo = (tipo) => (esTipoMenu(tipo) ? "menu" : esTipoWifi(tipo) ? "wifi" : "resenas");
+// Tipos que guardan datos de red: el Wi-Fi puro (obligatorios) y el menú con QR de Wi-Fi (opcionales).
+const esTipoConRed = (tipo) => esTipoWifi(tipo) || tipo === TIPO_MENU_WIFI;
+const categoriaTipo = (tipo) => (tipo === TIPO_MENU_WIFI ? "menu+wifi" : esTipoMenu(tipo) ? "menu" : esTipoWifi(tipo) ? "wifi" : "resenas");
 
 const WIFI_SEGURIDADES = ["WPA", "WEP", "nopass"];
 // Valida la red de un display Wi-Fi. Devuelve { ssid, password, seguridad } o un texto de error.
