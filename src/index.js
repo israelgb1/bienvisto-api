@@ -215,6 +215,13 @@ async function handleApi(request, env, url) {
       return altaDisplays(request, env, usuario);
     }
 
+    // Datos de red de un display Wi-Fi (solo quien puede editar inventario ve la contraseña).
+    const mWifi = path.match(/^\/api\/displays\/([A-Za-z0-9]{4})\/wifi$/);
+    if (mWifi && method === "GET") {
+      const w = await env.DB.prepare("SELECT ssid, password, seguridad FROM wifi_displays WHERE folio = ?").bind(mWifi[1].toUpperCase()).first();
+      return Response.json(w || { ssid: "", password: "", seguridad: "WPA" }, { headers: { "Cache-Control": "no-store" } });
+    }
+
     if (path.startsWith("/api/displays/") && method === "PATCH") {
       return actualizarFolio(request, env, url, usuario);
     }
@@ -687,8 +694,8 @@ async function asignarDisplays(request, env, usuario) {
     return json({ error: "Solo se asignan displays libres" }, 409);
   }
   // La app de vendedores solo vende displays de reseñas; los de menú se gestionan desde el panel.
-  if (vendedor && results.some((r) => esTipoMenu(r.lote_tipo))) {
-    return json({ error: "Los displays de menú todavía no se asignan a vendedores" }, 409);
+  if (vendedor && results.some((r) => esTipoSoloPanel(r.lote_tipo))) {
+    return json({ error: "Los displays de menú y de Wi-Fi todavía no se asignan a vendedores" }, 409);
   }
   const enVenta = await env.DB.prepare(`SELECT folio FROM venta_folios WHERE folio IN (${marcas}) LIMIT 1`).bind(...folios).first();
   if (enVenta) return json({ error: `El display ${enVenta.folio} está en una venta sin cobrar. Cóbrala o anúlala antes de reasignarlo.` }, 409);
@@ -733,11 +740,11 @@ async function actualizarLote(request, env, url, usuario) {
   const nota = "nota" in body ? (typeof body.nota === "string" && body.nota.trim() ? body.nota.trim().slice(0, 300) : null) : existe.nota;
 
   // Cambiar a o desde "menú" cambia cómo se valida y se redirige cada folio: solo con el lote intacto.
-  if (esTipoMenu(tipo) !== esTipoMenu(existe.tipo)) {
+  if (categoriaTipo(tipo) !== categoriaTipo(existe.tipo)) {
     const uso = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM folios WHERE lote_id = ? AND (estado != 'libre' OR vendedor_id IS NOT NULL OR url_destino IS NOT NULL)"
     ).bind(id).first();
-    if (uso && uso.n > 0) return json({ error: "El lote tiene displays en uso o asignados; no se puede cambiar entre reseñas y menú." }, 409);
+    if (uso && uso.n > 0) return json({ error: "El lote tiene displays en uso o asignados; no se puede cambiar entre reseñas, menú y Wi-Fi." }, 409);
   }
 
   await env.DB.batch([
@@ -785,6 +792,7 @@ async function borrarLote(env, url, usuario) {
 
   await env.DB.batch([
     env.DB.prepare("DELETE FROM auditoria_estados WHERE folio IN (SELECT folio FROM folios WHERE lote_id = ?)").bind(id),
+    env.DB.prepare("DELETE FROM wifi_displays WHERE folio IN (SELECT folio FROM folios WHERE lote_id = ?)").bind(id),
     env.DB.prepare("DELETE FROM folios WHERE lote_id = ?").bind(id),
     env.DB.prepare("DELETE FROM lotes WHERE id = ?").bind(id),
     env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, NULL)").bind(usuario, `Borró el lote ${id} (${folios ? folios.n : 0} displays)`),
@@ -2069,6 +2077,20 @@ async function actualizarFolio(request, env, url, usuario) {
     return json({ error: "Folio no encontrado" }, 404);
   }
   const esMenu = esTipoMenu(actual.lote_tipo);
+  const esWifi = esTipoWifi(actual.lote_tipo);
+
+  // Wi-Fi: no lleva enlace y los datos de la red se validan aparte.
+  let red = null;
+  if (esWifi) {
+    if (body.url_destino !== undefined && body.url_destino !== null) return json({ error: "Los displays de Wi-Fi no llevan enlace" }, 400);
+    if (body.wifi !== undefined) {
+      const v = validarWifi(body.wifi);
+      if (typeof v === "string") return json({ error: v }, 400);
+      red = v;
+    }
+  } else if (body.wifi !== undefined) {
+    return json({ error: "Solo los displays de tipo Wi-Fi tienen datos de red" }, 400);
+  }
 
   if (body.url_destino !== undefined && body.url_destino !== null && !esUrlDestino(body.url_destino, actual.lote_tipo)) {
     return json({ error: esMenu ? "El enlace del menú debe ser una URL https pública" : "url_destino debe ser una URL https de Google" }, 400);
@@ -2082,6 +2104,14 @@ async function actualizarFolio(request, env, url, usuario) {
     const urlFinal = "url_destino" in body ? body.url_destino : actual.url_destino;
     if (nuevoEstado === "activo" && !esUrlMenu(urlFinal)) {
       return json({ error: "Para activar un display de menú, primero pon el enlace del menú" }, 400);
+    }
+  }
+
+  if (esWifi) {
+    if (nuevoEstado === "prueba") return json({ error: "Los displays de Wi-Fi no tienen periodo de prueba" }, 400);
+    if (nuevoEstado === "activo" && !red) {
+      const ya = await env.DB.prepare("SELECT 1 AS x FROM wifi_displays WHERE folio = ?").bind(folio).first();
+      if (!ya) return json({ error: "Para activar un display Wi-Fi, primero pon el nombre y la contraseña de la red" }, 400);
     }
   }
 
@@ -2115,6 +2145,21 @@ async function actualizarFolio(request, env, url, usuario) {
   const stmts = [
     env.DB.prepare(`UPDATE folios SET ${sets.join(", ")} WHERE folio = ?`).bind(...params, folio),
   ];
+  if (esWifi) {
+    if (red) {
+      stmts.push(
+        env.DB.prepare(
+          "INSERT INTO wifi_displays (folio, ssid, password, seguridad, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(folio) DO UPDATE SET ssid = excluded.ssid, password = excluded.password, seguridad = excluded.seguridad, updated_at = CURRENT_TIMESTAMP"
+        ).bind(folio, red.ssid, red.password, red.seguridad),
+        // Nunca se registra la contraseña, solo el nombre de la red.
+        env.DB.prepare("INSERT INTO auditoria (usuario, accion, folio_afectado) VALUES (?, ?, ?)").bind(usuario, `Configuró la red Wi-Fi "${red.ssid}"`, folio)
+      );
+    }
+    // Un display que vuelve a libre se recicla para otro negocio: la red anterior no debe quedarse guardada.
+    if (nuevoEstado === "libre" && actual.estado !== "libre") {
+      stmts.push(env.DB.prepare("DELETE FROM wifi_displays WHERE folio = ?").bind(folio));
+    }
+  }
   if (actual.estado !== nuevoEstado) {
     stmts.push(
       env.DB.prepare(
@@ -2190,7 +2235,8 @@ async function handleRedirect(request, env, url) {
 
   await aplicarVencimientos(env, "sistema", folio, (await leerConfig(env)).prueba_minutos);
   const display = await env.DB.prepare(
-    "SELECT f.estado, f.url_destino, l.tipo AS lote_tipo FROM folios f LEFT JOIN lotes l ON l.id = f.lote_id WHERE f.folio = ?"
+    `SELECT f.estado, f.url_destino, f.negocio_asignado, l.tipo AS lote_tipo, w.ssid AS w_ssid, w.password AS w_password, w.seguridad AS w_seguridad
+     FROM folios f LEFT JOIN lotes l ON l.id = f.lote_id LEFT JOIN wifi_displays w ON w.folio = f.folio WHERE f.folio = ?`
   )
     .bind(folio)
     .first();
@@ -2209,12 +2255,21 @@ async function handleRedirect(request, env, url) {
 
   // 'activo' o 'prueba' (ya vencimos las pruebas caducas) con reseña válida redirige.
   const esMenu = esTipoMenu(display.lote_tipo);
+  const esWifi = esTipoWifi(display.lote_tipo);
+  // Wi-Fi activo con red configurada: se muestra la red (sin caché ni indexación: lleva la contraseña).
+  if (esWifi && display.estado === "activo" && display.w_ssid) {
+    const red = { ssid: display.w_ssid, password: display.w_password, seguridad: display.w_seguridad };
+    return new Response(request.method === "HEAD" ? null : paginaWifi(display.negocio_asignado, red), {
+      status: 200,
+      headers: { "Content-Type": "text/html;charset=UTF-8", "X-Robots-Tag": "noindex", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+    });
+  }
   if ((display.estado === "activo" || display.estado === "prueba") && esUrlDestino(display.url_destino, display.lote_tipo)) {
     return Response.redirect(display.url_destino, 302);
   }
   // Libre: landing de Bien Visto.
   if (display.estado === "libre") {
-    return new Response(request.method === "HEAD" ? null : esMenu ? paginaLibreMenu(folio) : paginaLibre(folio), {
+    return new Response(request.method === "HEAD" ? null : esWifi ? paginaLibreWifi(folio) : esMenu ? paginaLibreMenu(folio) : paginaLibre(folio), {
       status: 200,
       headers: { "Content-Type": "text/html;charset=UTF-8", "X-Robots-Tag": "noindex" },
     });
@@ -2224,7 +2279,7 @@ async function handleRedirect(request, env, url) {
   const html = `<!DOCTYPE html>
 <html lang="es">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="robots" content="noindex"><title>Display no disponible</title><style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f5f5f5;margin:0;}div{background:#fff;padding:40px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.1);text-align:center;}</style></head>
-<body><div><h2>Este display no está disponible por ahora</h2><p>${esMenu ? "Gracias por escanear. Pide el menú directamente en el establecimiento." : "Gracias por querer dejar tu opinión. Puedes buscar el negocio en Google Maps para dejar tu reseña."}</p><p style="font-size:13px;opacity:.7">Folio ${esc(folio)}</p></div></body>
+<body><div><h2>Este display no está disponible por ahora</h2><p>${esWifi ? "Gracias por escanear. Pide la clave del Wi-Fi directamente en el establecimiento." : esMenu ? "Gracias por escanear. Pide el menú directamente en el establecimiento." : "Gracias por querer dejar tu opinión. Puedes buscar el negocio en Google Maps para dejar tu reseña."}</p><p style="font-size:13px;opacity:.7">Folio ${esc(folio)}</p></div></body>
 </html>`;
 
   return new Response(request.method === "HEAD" ? null : html, {
@@ -2260,6 +2315,7 @@ async function permisosRequeridos(request, env, url, method, path) {
     if (path === "/api/escaneos/serie" || path === "/api/pruebas/resumen") return sin(["ver_resumen"]);
     if (path === "/api/seguimiento/hoy") return sin(["ver_cobros"]);
     if (path === "/api/displays" || path === "/api/lotes") return sin(["ver_inventario"]);
+    if (/^\/api\/displays\/[A-Za-z0-9]{4}\/wifi$/.test(path)) return sin(["inventario_editar"]);
     if (path === "/api/vendedores" || path === "/api/solicitudes" || path === "/api/cuentas-cobro" || path === "/api/altas-vendedor") return sin(["ver_vendedores"]);
     if (path === "/api/ventas" || path === "/api/cortes" || path === "/api/avisos-entrega" || path === "/api/precios" || /^\/api\/ventas\/[^/]+\/comprobante$/.test(path) || /^\/api\/avisos-entrega\/[^/]+\/comprobante$/.test(path)) return sin(["ver_cobros"]);
     // Ajustes y Precios necesitan la configuración; cada sección se revisa en la UI y el PATCH se revisa por campo.
@@ -2732,6 +2788,31 @@ function randomDe(conjunto) {
 const TIPO_RESENAS = "Reseñas de Google";
 const TIPO_MENU = "Menú digital (redirección)";
 const esTipoMenu = (tipo) => tipo === TIPO_MENU;
+// "Wi-Fi": al escanearlo se muestra la red y la contraseña del negocio (no redirige a otro sitio).
+const TIPO_WIFI = "Wi-Fi";
+const esTipoWifi = (tipo) => tipo === TIPO_WIFI;
+// Menú y Wi-Fi se gestionan solo desde el panel: no se asignan a vendedores ni tienen periodo de prueba.
+const esTipoSoloPanel = (tipo) => esTipoMenu(tipo) || esTipoWifi(tipo);
+const categoriaTipo = (tipo) => (esTipoMenu(tipo) ? "menu" : esTipoWifi(tipo) ? "wifi" : "resenas");
+
+const WIFI_SEGURIDADES = ["WPA", "WEP", "nopass"];
+// Valida la red de un display Wi-Fi. Devuelve { ssid, password, seguridad } o un texto de error.
+function validarWifi(w) {
+  if (!w || typeof w !== "object") return "Faltan los datos de la red";
+  const ssid = typeof w.ssid === "string" ? w.ssid.trim() : "";
+  if (!ssid) return "Escribe el nombre de la red";
+  if (new TextEncoder().encode(ssid).length > 32) return "El nombre de la red no puede pasar de 32 caracteres";
+  const seguridad = w.seguridad === undefined ? "WPA" : w.seguridad;
+  if (!WIFI_SEGURIDADES.includes(seguridad)) return "Tipo de seguridad no válido";
+  if (seguridad === "nopass") return { ssid, password: null, seguridad };
+  const password = typeof w.password === "string" ? w.password : "";
+  if (!password) return "Escribe la contraseña de la red";
+  if (/[\u0000-\u001f\u007f]/.test(password)) return "La contraseña tiene caracteres no válidos";
+  const largo = password.length;
+  if (seguridad === "WPA" && (largo < 8 || largo > 63)) return "Una contraseña WPA tiene de 8 a 63 caracteres";
+  if (seguridad === "WEP" && largo > 63) return "La contraseña es demasiado larga";
+  return { ssid, password, seguridad };
+}
 
 // Menú: cualquier sitio público por https. Sin credenciales en la URL, sin IPs ni hosts internos
 // y sin apuntar a ir.bienvisto.com.mx (evita bucles de redirección).
@@ -3449,6 +3530,70 @@ async function enviarPendientes(env) {
 
 // Búsqueda de negocios en Google Places (API New). La clave vive en env.GOOGLE_PLACES_KEY, nunca en el navegador.
 // Landing de un display libre (ir.bienvisto.com.mx/FOLIO). Estilo: brandbook v1.2.
+const WIFI_BASE_CSS = `:root{--verde:#0E6B5C;--ambar:#F2A71B;--tinta:#12302B;--crema:#FBF6EC;--menta:#E7F0EC;--borde:#CFDDD6}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%}
+body{background:var(--crema);color:var(--tinta);font:400 16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px 18px}
+.tarjeta{width:100%;max-width:400px;background:var(--verde);color:var(--crema);border-radius:26px;padding:26px 20px 22px;text-align:center}
+h1{font:700 25px/1.15 system-ui,sans-serif;letter-spacing:-.015em;margin:0 0 6px;text-wrap:balance;overflow-wrap:anywhere}
+.sub{margin:0 0 18px;font-size:15px;opacity:.92}
+.dato{background:var(--menta);color:var(--tinta);border-radius:16px;padding:12px 14px;text-align:left;margin:0 0 10px}
+.dato small{display:block;font-size:13px;font-weight:600;color:#3F5A53;margin:0 0 2px}
+.dato output{display:block;font:600 20px/1.3 ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere;word-break:break-all}
+.fila{display:flex;gap:8px;margin:8px 0 0}
+.btn{flex:1;font:600 16px/1.2 system-ui,sans-serif;padding:12px 14px;border-radius:999px;border:0;background:var(--ambar);color:var(--tinta);cursor:pointer;text-decoration:none;text-align:center;display:block}
+.btn.s{background:#fff;border:2px solid var(--borde)}
+.btn:focus-visible{outline:3px solid var(--verde);outline-offset:2px}
+.pasos{margin:16px 0 0;font-size:14px;line-height:1.45;opacity:.95;text-align:left}
+.aviso{font-size:13px;margin:14px 0 0;opacity:.85}
+.folio{display:inline-block;margin:0 0 14px;padding:5px 14px;border-radius:999px;background:rgba(251,246,236,.14);font-size:14px}
+.folio b{letter-spacing:.1em}`;
+
+// Página pública del display Wi-Fi activo: red, contraseña y botones para copiarlas.
+function paginaWifi(negocio, red) {
+  const sinClave = red.seguridad === "nopass";
+  const nombre = negocio ? esc(negocio) : "Wi-Fi para clientes";
+  return `<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer"><title>Wi-Fi · ${nombre}</title>
+<style>${WIFI_BASE_CSS}</style></head>
+<body><main class="tarjeta">
+<h1>${nombre}</h1>
+<p class="sub">Conéctate a nuestra red Wi-Fi</p>
+<div class="dato"><small id="l1">Red</small><output id="ssid" aria-labelledby="l1">${esc(red.ssid)}</output></div>
+${sinClave ? `<div class="dato"><small>Contraseña</small><output>Esta red no tiene contraseña</output></div>` : `<div class="dato"><small id="l2">Contraseña</small><output id="pass" aria-labelledby="l2">${esc(red.password)}</output></div>
+<div class="fila"><button class="btn" type="button" id="cp">Copiar contraseña</button><button class="btn s" type="button" id="cs">Copiar red</button></div>
+<p id="ok" role="status" aria-live="polite" class="aviso" hidden></p>`}
+<ol class="pasos"><li>Abre los ajustes de Wi-Fi de tu teléfono.</li><li>Elige la red <b>${esc(red.ssid)}</b>.</li>${sinClave ? "" : "<li>Pega o escribe la contraseña.</li>"}</ol>
+<p class="aviso">Display Bien Visto</p>
+</main>
+<script>
+(function(){
+  function copiar(t,m){
+    function listo(){var o=document.getElementById("ok");if(o){o.hidden=false;o.textContent=m;setTimeout(function(){o.hidden=true},2000)}}
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(listo,fallback)}else fallback();
+    function fallback(){var a=document.createElement("textarea");a.value=t;a.setAttribute("readonly","");a.style.position="fixed";a.style.opacity="0";document.body.appendChild(a);a.select();try{document.execCommand("copy");listo()}catch(e){}a.remove()}
+  }
+  var cp=document.getElementById("cp"),cs=document.getElementById("cs");
+  if(cp)cp.onclick=function(){copiar(document.getElementById("pass").textContent,"Contraseña copiada")};
+  if(cs)cs.onclick=function(){copiar(document.getElementById("ssid").textContent,"Red copiada")};
+})();
+</script></body></html>`;
+}
+
+// Display Wi-Fi sin activar.
+function paginaLibreWifi(folio) {
+  const f = esc(folio);
+  return `<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Bien Visto</title>
+<style>${WIFI_BASE_CSS}p{margin:0 auto 18px;max-width:32ch;font-size:15.5px}</style></head>
+<body><main class="tarjeta">
+<p class="folio">Display <b>${f}</b></p>
+<h1>Wi-Fi para tus clientes, a un escaneo</h1>
+<p>Este display Wi-Fi de Bien Visto todavía no está activado. Si tienes un negocio, te contamos cómo tener el tuyo.</p>
+<a class="btn" href="https://bienvisto.com.mx/quiero?utm_source=display&amp;utm_medium=impreso&amp;utm_campaign=wifi&amp;utm_content=${f}">Quiero un display Wi-Fi</a>
+</main></body></html>`;
+}
+
 // Display de menú sin activar: lo escanea un restaurante interesado o alguien que lo encontró.
 function paginaLibreMenu(folio) {
   const f = esc(folio);
