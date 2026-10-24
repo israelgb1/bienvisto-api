@@ -289,10 +289,10 @@ async function handleApi(request, env, url) {
 async function listarFolios(env) {
   await aplicarVencimientos(env, "sistema", null, (await leerConfig(env)).prueba_minutos);
   const { results } = await env.DB.prepare(
-    `SELECT f.folio, f.estado, f.negocio_asignado, f.url_destino, f.lote_id, f.vendedor_id, f.prueba_inicio, f.created_at, f.updated_at,
+    `SELECT f.folio, f.estado, f.negocio_asignado, f.url_destino, f.lote_id, f.vendedor_id, f.prueba_inicio, f.created_at, f.updated_at, l.tipo AS lote_tipo,
       (SELECT COUNT(*) FROM escaneos e WHERE e.folio = f.folio AND e.contado = 1 AND e.created_at >= datetime('now', '-7 days')) AS esc7,
       (SELECT COUNT(*) FROM escaneos e WHERE e.folio = f.folio AND e.contado = 1 AND e.created_at >= datetime('now', '-30 days')) AS esc30
-     FROM folios f ORDER BY f.created_at DESC`
+     FROM folios f LEFT JOIN lotes l ON l.id = f.lote_id ORDER BY f.created_at DESC`
   ).all();
   return json(results);
 }
@@ -677,12 +677,18 @@ async function asignarDisplays(request, env, usuario) {
   }
 
   const marcas = folios.map(() => "?").join(",");
-  const { results } = await env.DB.prepare(`SELECT folio, estado FROM folios WHERE folio IN (${marcas})`).bind(...folios).all();
+  const { results } = await env.DB.prepare(
+    `SELECT f.folio, f.estado, l.tipo AS lote_tipo FROM folios f LEFT JOIN lotes l ON l.id = f.lote_id WHERE f.folio IN (${marcas})`
+  ).bind(...folios).all();
   if (results.length !== folios.length) {
     return json({ error: "Algún folio no existe" }, 404);
   }
   if (results.some((r) => r.estado !== "libre")) {
     return json({ error: "Solo se asignan displays libres" }, 409);
+  }
+  // La app de vendedores solo vende displays de reseñas; los de menú se gestionan desde el panel.
+  if (vendedor && results.some((r) => esTipoMenu(r.lote_tipo))) {
+    return json({ error: "Los displays de menú todavía no se asignan a vendedores" }, 409);
   }
   const enVenta = await env.DB.prepare(`SELECT folio FROM venta_folios WHERE folio IN (${marcas}) LIMIT 1`).bind(...folios).first();
   if (enVenta) return json({ error: `El display ${enVenta.folio} está en una venta sin cobrar. Cóbrala o anúlala antes de reasignarlo.` }, 409);
@@ -725,6 +731,14 @@ async function actualizarLote(request, env, url, usuario) {
   }
   const destino = "destino" in body ? (typeof body.destino === "string" && body.destino.trim() ? body.destino.trim().slice(0, 200) : null) : existe.destino;
   const nota = "nota" in body ? (typeof body.nota === "string" && body.nota.trim() ? body.nota.trim().slice(0, 300) : null) : existe.nota;
+
+  // Cambiar a o desde "menú" cambia cómo se valida y se redirige cada folio: solo con el lote intacto.
+  if (esTipoMenu(tipo) !== esTipoMenu(existe.tipo)) {
+    const uso = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM folios WHERE lote_id = ? AND (estado != 'libre' OR vendedor_id IS NOT NULL OR url_destino IS NOT NULL)"
+    ).bind(id).first();
+    if (uso && uso.n > 0) return json({ error: "El lote tiene displays en uso o asignados; no se puede cambiar entre reseñas y menú." }, 409);
+  }
 
   await env.DB.batch([
     env.DB.prepare("UPDATE lotes SET tipo = ?, costo = ?, destino = ?, nota = ? WHERE id = ?").bind(tipo, costo, destino, nota, id),
@@ -2041,9 +2055,6 @@ async function actualizarFolio(request, env, url, usuario) {
   if (body.estado !== undefined && !ESTADOS.includes(body.estado)) {
     return json({ error: "Estado no válido" }, 400);
   }
-  if (body.url_destino !== undefined && body.url_destino !== null && !esUrlResena(body.url_destino)) {
-    return json({ error: "url_destino debe ser una URL https de Google" }, 400);
-  }
   if (body.negocio_asignado !== undefined && body.negocio_asignado !== null) {
     if (typeof body.negocio_asignado !== "string" || body.negocio_asignado.length > 200) {
       return json({ error: "negocio_asignado no válido" }, 400);
@@ -2051,12 +2062,28 @@ async function actualizarFolio(request, env, url, usuario) {
   }
 
   await aplicarVencimientos(env, usuario, folio, (await leerConfig(env)).prueba_minutos);
-  const actual = await env.DB.prepare("SELECT estado FROM folios WHERE folio = ?").bind(folio).first();
+  const actual = await env.DB.prepare(
+    "SELECT f.estado, f.url_destino, l.tipo AS lote_tipo FROM folios f LEFT JOIN lotes l ON l.id = f.lote_id WHERE f.folio = ?"
+  ).bind(folio).first();
   if (!actual) {
     return json({ error: "Folio no encontrado" }, 404);
   }
+  const esMenu = esTipoMenu(actual.lote_tipo);
+
+  if (body.url_destino !== undefined && body.url_destino !== null && !esUrlDestino(body.url_destino, actual.lote_tipo)) {
+    return json({ error: esMenu ? "El enlace del menú debe ser una URL https pública" : "url_destino debe ser una URL https de Google" }, 400);
+  }
 
   const nuevoEstado = body.estado !== undefined ? body.estado : actual.estado;
+
+  // Los displays de menú no tienen periodo de prueba y, para estar activos, necesitan un enlace válido.
+  if (esMenu) {
+    if (nuevoEstado === "prueba") return json({ error: "Los displays de menú no tienen periodo de prueba" }, 400);
+    const urlFinal = "url_destino" in body ? body.url_destino : actual.url_destino;
+    if (nuevoEstado === "activo" && !esUrlMenu(urlFinal)) {
+      return json({ error: "Para activar un display de menú, primero pon el enlace del menú" }, 400);
+    }
+  }
 
   // Un display de una venta ya cobrada o entregada no cambia de estado a mano: el dinero
   // de esa venta sigue vigente. Para liberarlo hay que anular la venta (revierte displays y deuda).
@@ -2162,7 +2189,9 @@ async function handleRedirect(request, env, url) {
   }
 
   await aplicarVencimientos(env, "sistema", folio, (await leerConfig(env)).prueba_minutos);
-  const display = await env.DB.prepare("SELECT estado, url_destino FROM folios WHERE folio = ?")
+  const display = await env.DB.prepare(
+    "SELECT f.estado, f.url_destino, l.tipo AS lote_tipo FROM folios f LEFT JOIN lotes l ON l.id = f.lote_id WHERE f.folio = ?"
+  )
     .bind(folio)
     .first();
 
@@ -2179,12 +2208,13 @@ async function handleRedirect(request, env, url) {
   }
 
   // 'activo' o 'prueba' (ya vencimos las pruebas caducas) con reseña válida redirige.
-  if ((display.estado === "activo" || display.estado === "prueba") && esUrlResena(display.url_destino)) {
+  const esMenu = esTipoMenu(display.lote_tipo);
+  if ((display.estado === "activo" || display.estado === "prueba") && esUrlDestino(display.url_destino, display.lote_tipo)) {
     return Response.redirect(display.url_destino, 302);
   }
   // Libre: landing de Bien Visto.
   if (display.estado === "libre") {
-    return new Response(request.method === "HEAD" ? null : paginaLibre(folio), {
+    return new Response(request.method === "HEAD" ? null : esMenu ? paginaLibreMenu(folio) : paginaLibre(folio), {
       status: 200,
       headers: { "Content-Type": "text/html;charset=UTF-8", "X-Robots-Tag": "noindex" },
     });
@@ -2194,7 +2224,7 @@ async function handleRedirect(request, env, url) {
   const html = `<!DOCTYPE html>
 <html lang="es">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="robots" content="noindex"><title>Display no disponible</title><style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f5f5f5;margin:0;}div{background:#fff;padding:40px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.1);text-align:center;}</style></head>
-<body><div><h2>Este display no está disponible por ahora</h2><p>Gracias por querer dejar tu opinión. Puedes buscar el negocio en Google Maps para dejar tu reseña.</p><p style="font-size:13px;opacity:.7">Folio ${esc(folio)}</p></div></body>
+<body><div><h2>Este display no está disponible por ahora</h2><p>${esMenu ? "Gracias por escanear. Pide el menú directamente en el establecimiento." : "Gracias por querer dejar tu opinión. Puedes buscar el negocio en Google Maps para dejar tu reseña."}</p><p style="font-size:13px;opacity:.7">Folio ${esc(folio)}</p></div></body>
 </html>`;
 
   return new Response(request.method === "HEAD" ? null : html, {
@@ -2695,6 +2725,33 @@ function randomDe(conjunto) {
   const buf = new Uint32Array(1);
   crypto.getRandomValues(buf);
   return conjunto[buf[0] % conjunto.length];
+}
+
+// Tipos de display. El tipo vive en el lote: un folio es de menú si su lote lo es.
+// "Menú digital (redirección)" manda al enlace que da el restaurante (Drive, PDF, su propio menú, etc.).
+const TIPO_RESENAS = "Reseñas de Google";
+const TIPO_MENU = "Menú digital (redirección)";
+const esTipoMenu = (tipo) => tipo === TIPO_MENU;
+
+// Menú: cualquier sitio público por https. Sin credenciales en la URL, sin IPs ni hosts internos
+// y sin apuntar a ir.bienvisto.com.mx (evita bucles de redirección).
+function esUrlMenu(valor) {
+  if (typeof valor !== "string" || valor.length > 2000) return false;
+  try {
+    const u = new URL(valor);
+    if (u.protocol !== "https:" || u.username || u.password) return false;
+    const h = u.hostname.toLowerCase();
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(h)) return false;
+    if (h === "ir.bienvisto.com.mx" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// El destino válido depende del tipo del display.
+function esUrlDestino(valor, tipo) {
+  return esTipoMenu(tipo) ? esUrlMenu(valor) : esUrlResena(valor);
 }
 
 // Google: g.page o cualquier subdominio de google.com, siempre https.
@@ -3392,6 +3449,32 @@ async function enviarPendientes(env) {
 
 // Búsqueda de negocios en Google Places (API New). La clave vive en env.GOOGLE_PLACES_KEY, nunca en el navegador.
 // Landing de un display libre (ir.bienvisto.com.mx/FOLIO). Estilo: brandbook v1.2.
+// Display de menú sin activar: lo escanea un restaurante interesado o alguien que lo encontró.
+function paginaLibreMenu(folio) {
+  const f = esc(folio);
+  return `<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Bien Visto</title>
+<style>
+:root{--verde:#0E6B5C;--ambar:#F2A71B;--tinta:#12302B;--crema:#FBF6EC}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%}
+body{background:var(--crema);color:var(--tinta);font:400 16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px 18px}
+.tarjeta{width:100%;max-width:380px;background:var(--verde);color:var(--crema);border-radius:26px;padding:28px 22px 24px;text-align:center}
+h1{font:700 26px/1.15 system-ui,sans-serif;letter-spacing:-.015em;margin:0 0 10px;text-wrap:balance}
+p{margin:0 auto 18px;max-width:32ch;font-size:15.5px;opacity:.95}
+.folio{display:inline-block;margin:0 0 16px;padding:5px 14px;border-radius:999px;background:rgba(251,246,236,.14);font-size:14px}
+.folio b{letter-spacing:.1em}
+.btn{display:block;text-align:center;text-decoration:none;font:600 18px/1.2 system-ui,sans-serif;padding:15px 20px;border-radius:999px;background:var(--ambar);color:var(--tinta)}
+.btn:focus-visible{outline:3px solid var(--crema);outline-offset:3px}
+</style></head>
+<body><main class="tarjeta">
+<p class="folio">Display <b>${f}</b></p>
+<h1>Tu menú, a un escaneo de tus clientes</h1>
+<p>Este display de menú de Bien Visto todavía no está activado. Si tienes un restaurante o una cafetería, te contamos cómo tener el tuyo.</p>
+<a class="btn" href="https://bienvisto.com.mx/quiero?utm_source=display&amp;utm_medium=impreso&amp;utm_campaign=menu&amp;utm_content=${f}">Quiero un display de menú</a>
+</main></body></html>`;
+}
+
 function paginaLibre(folio) {
   const f = esc(folio);
   return `<!DOCTYPE html>
